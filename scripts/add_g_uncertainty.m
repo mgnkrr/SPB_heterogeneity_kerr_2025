@@ -1,12 +1,13 @@
 function S = add_g_uncertainty(~, varargin)
-% Compute σ(Gmin) via FD propagation and aggregate σ(GΔ) per model.
+% ADD_G_UNCERTAINTY  Compute σ(Gmin) via FD propagation and aggregate σ(GΔ) per model.
 % Usage:
 %   S = add_g_uncertainty('datasets_for_gmin/gmin_data.mat', ...
 %         'sigma_Ts',1.5,'sigma_Mb',0.02,'sigma_H',50, ...
 %         'delta_Ts',0.5,'delta_Mb',0.01,'delta_H',5, ...
 %         'cache_dir','', 'use_cache',true, 'save',true,'outfile','')
 
-datafile = 'datasets/gmin_data.mat';
+datafile = 'datasets_for_gmin/gmin_data.mat';
+addpath('/Users/megankerr/Documents/Location-oldest-ice/ghf/utils');
 
 p = inputParser;
 % uncertainty inputs
@@ -30,14 +31,17 @@ logf = @(varargin) ( opt.verbose && fprintf('[add_g_uncertainty] %s\n', sprintf(
 assert(isfile(datafile), 'Data file not found: %s', datafile);
 L = load(datafile,'S'); S = L.S; clear L;
 
-% ---------- ROI ----------
+assert(isequal(size(S.Ts), size(S.H)), 'S.Ts size mismatch vs S.H');
+assert(isequal(size(S.Mb), size(S.H)), 'S.Mb size mismatch vs S.H');
+
+% ---------- ROI (for consistency with downstream stats) ----------
 if isfield(S,'eval_mask') && isequal(size(S.eval_mask), size(S.H))
     Mv = logical(S.eval_mask);
 else
     Mv = isfinite(S.H);
 end
 
-% ---------- cfg----------
+% ---------- build cfg expected by estimate_sigma_gmin_fd ----------
 flat_unc = struct('sigma_Ts',opt.sigma_Ts, 'sigma_Mb',opt.sigma_Mb, 'sigma_H',opt.sigma_H, ...
                   'delta_Ts',opt.delta_Ts, 'delta_Mb',opt.delta_Mb, 'delta_H',opt.delta_H);
 cfg_gmin = struct('gmin_unc', flat_unc, ...
@@ -46,7 +50,7 @@ cfg_gmin = struct('gmin_unc', flat_unc, ...
                   'use_single', isa(S.H,'single'), ...
                   'use_cache', logical(opt.use_cache));
 
-% caching
+% cache_dir default lives next to the datafile
 if isempty(opt.cache_dir)
     data_dir = fileparts(char(datafile)); if isempty(data_dir) || ~isfolder(data_dir), data_dir = pwd; end
     opt.cache_dir = fullfile(data_dir, '_sigma_cache');
@@ -69,7 +73,7 @@ nM = numel(S.names);
 validNames = cellfun(@(c) matlab.lang.makeValidName(c), S.names, 'uni', 0);
 
 % optional fallback scalar per-model uncertainties (mW/m^2)
-fallback_err = struct(); 
+fallback_err = struct();  % e.g., fallback_err.Hazzard = 15;
 
 nGood = nnz(Mv);
 S.sigma_gdif_mean   = nan(nM,1);
@@ -83,12 +87,12 @@ end
 
 for i = 1:nM
     field_i = validNames{i};
-    % per-pixel σ for model
+    % per-pixel σ for model, if available
     if isfield(S,'unc') && isfield(S.unc, field_i) && ~isempty(S.unc.(field_i)) ...
             && isequal(size(S.unc.(field_i)), size(S.H))
         tmp = S.unc.(field_i);
         sigM_vec = double(tmp(Mv));
-    % derive σ from min/max bounds for Losing
+    % derive σ from bounds for Losing
     elseif strcmp(field_i,'Losing') && isfield(S,'bounds') ...
             && all(isfield(S.bounds, {'Losing_min','Losing_max'})) ...
             && isequal(size(S.bounds.Losing_min), size(S.H)) ...

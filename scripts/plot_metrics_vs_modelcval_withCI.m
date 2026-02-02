@@ -1,5 +1,9 @@
 function plot_metrics_vs_modelcval_withCI(S, cfg)
-% G-mean vs model mean with bootstrapped confidence intervals
+% G-mean vs model median WITH bootstrapped confidence intervals
+% - Y = metric EXP from S.Gstats (default 'G_ISPBwet_OSPBdry_raw') with CI (and inner CIi)
+% - X = model medians via resolve_model_medians_robust(S)
+% - Flats faded; non-flats labeled; optional manual point shown
+%
 % Usage:
 %   L = load('figs_out/artifacts/S_plot_small_YYYYMMDD_HHmmss.mat');
 %   plot_metrics_vs_modelcval_withCI(L.S_plot, L.cfg_plot)
@@ -12,35 +16,38 @@ if ~isfield(cfg,'region') || ~isfield(cfg.region,'mode') || isempty(cfg.region.m
     cfg.region.mode = 'ALL';
 end
 
+% Default metric is the new regional G-mean
 % 'G_ISPBwet_OSPBdry_raw' | 'REC_ISPB_wet_raw' | 'REC_OSPB_dry_raw'
 % plus legacy options: 'G_raw' | 'REC_raw' | 'SPEC_raw' | 'ACC_raw' | 'PREC_raw' | 'F1_raw'
 cfg = setdef(cfg, 'metric', 'G_raw');
 
 cfg = setdef(cfg, 'label_nonflats', true);
 cfg = setdef(cfg, 'exclude_names', {'MeanNonFlat'});
-cfg = setdef(cfg, 'draw_inner_band', false);   
+cfg = setdef(cfg, 'draw_inner_band', false);   % draw 50% CIi as thicker whisker
 cfg = setdef(cfg, 'manual_point', struct( ...
-    'enable', false, ...
-    'x', 46.59, ...
-    'y', 0.846, ...
-    'label', 'MCMC', ...
-    'y_CI95',   [NaN NaN], ...       
-    'y_CI50',   [NaN NaN], ...       
-    'x_CI95',   [NaN NaN], ...       
-    'x_CI50',   [NaN NaN], ...       
-    'capsize',  2, ...
+    'enable', true, ...
+    'x', 45.09, ...
+    'y', 0.801, ...
+    'label', 'Top 5% MCMC median', ...
+    ... % Optional CIs you can manually type in (should match chosen metric)
+    'y_CI95',   [0.794 0.810], ...   % e.g., [0.84 0.91]
+    'y_CI50',   [NaN NaN], ...       % optional inner/"thick" band
+    'x_CI95',   [NaN NaN], ...       % optional horizontal CI on x
+    'x_CI50',   [NaN NaN], ...       % optional inner x band
+    'capsize',  1, ...
     'linew',    1.2, ...
     'band',     true, ...
     'alpha',    0.22 ));
 
-cfg = setdef(cfg, 'fonts', struct('axis',11,'label',12));
+cfg = setdef(cfg, 'fonts', struct('axis',11,'label',12,'name',' Helvetica'));
+
 cfg = setdef(cfg, 'colors', struct('flat',[0.7 0.7 0.7], 'non',[0.00 0.45 0.70], 'manual',[0.90 0.20 0.10]));
 
-% ---------------- pull metric + CIs ----------------
+% ---------------- pull metric (+ CIs) ----------------
 [Y, Ylo, Yhi, Ylo_i, Yhi_i, ok] = pull_metric_with_ci(S, cfg.metric);
 assert(ok, 'Metric "%s" with CI not found in S.Gstats. Did bootstrap run?', cfg.metric);
 
-% ---------------- X axis ------------
+% ---------------- X axis (model medians; robust fallbacks) ------------
 X = resolve_model_medians_robust(S);
 
 % ---------------- names / flats / excludes ----------------------------
@@ -59,7 +66,7 @@ else
     titles = names;
 end
 
-% exclude specific names
+% exclude specific aggregate names (e.g., 'MeanNonFlat')
 excl = false(size(names));
 if ~isempty(cfg.exclude_names)
     lowNames = lower(strtrim(names));
@@ -69,7 +76,7 @@ if ~isempty(cfg.exclude_names)
     end
 end
 
-% order & masks
+% order, masks
 [x_ord, ord] = sort(X(:));
 Y_ord     = Y(ord);
 Ylo_ord   = Ylo(ord);   Yhi_ord   = Yhi(ord);
@@ -86,26 +93,32 @@ xspan = max(1, range_nonempty(x_ord(good)));
 f = figure('Color','w','Name','Metric vs Model Median'); 
 ax = axes('Parent',f); hold(ax,'on'); box(ax,'off');
 
-% Flat models 
+% --- Title includes specularity threshold (optional) ---
+if isfield(cfg,'title_suffix') && ~isempty(cfg.title_suffix)
+    title(ax, ['Metric vs Model Median' cfg.title_suffix], 'Interpreter','none', ...
+        'FontName', cfg.fonts.name, 'FontSize', cfg.fonts.label);
+end
+
+% Flat models (faded)
 maskF = isflat_ord & good;
 
-% Non-flat models
+% Non-flat models (colored)
 maskN = ~isflat_ord & good;
 if any(maskN)
     draw_ci_errorbars(ax, x_ord(maskN), Y_ord(maskN), Ylo_ord(maskN), Yhi_ord(maskN), ...
-        'Color', cfg.colors.non, 'CapSize', 2, 'LineW', 1.0, 'Band', true, 'Alpha', 0.25, ...
+        'Color', cfg.colors.non, 'CapSize', 1, 'LineW', 1.0, 'Band', true, 'Alpha', 0.25, ...
         'XSpan', xspan);
 
     if cfg.draw_inner_band && all(isfinite(Yloi_ord(maskN)))
         draw_ci_errorbars(ax, x_ord(maskN), Y_ord(maskN), Yloi_ord(maskN), Yhii_ord(maskN), ...
             'Color', cfg.colors.non, 'CapSize', 0, 'LineW', 1.6, 'Band', false);
     end
-    hPub = scatter(ax, x_ord(maskN), Y_ord(maskN), 42, 'o', ...
+    hPub = scatter(ax, x_ord(maskN), Y_ord(maskN), 20, 'o', ...
         'MarkerFaceColor',cfg.colors.non,'MarkerEdgeColor','k', ...
         'LineWidth',0.7,'DisplayName','Published/geophysical GHF models');
 end
 
-% ---- Interpolated trend for flat models ----
+% ---- Interpolated trend for flat models (dashed line) ----
 if any(maskF)
     [xq_flat, yq_flat] = build_flat_trend(x_ord(maskF), Y_ord(maskF));
     if ~isempty(xq_flat)
@@ -118,12 +131,12 @@ else
     hFlatTrend = [];
 end
 
-% Optional manual point
+% Optional manual point (with optional manual CIs)
 hMan = [];
 if isfield(cfg,'manual_point') && isstruct(cfg.manual_point) && isfield(cfg.manual_point,'enable') && cfg.manual_point.enable
     mp = cfg.manual_point;
 
-    % --- Vertical CI bands ---
+    % --- Vertical (Y) CI bands for the manual point ---
     if isfield(mp,'y_CI95') && numel(mp.y_CI95)==2 && any(isfinite(mp.y_CI95))
         draw_ci_errorbars(ax, mp.x, mp.y, mp.y_CI95(1), mp.y_CI95(2), ...
             'Color', cfg.colors.manual, 'CapSize', mp.capsize, 'LineW', mp.linew, ...
@@ -136,14 +149,16 @@ if isfield(cfg,'manual_point') && isstruct(cfg.manual_point) && isfield(cfg.manu
             'Band', false);
     end
 
-    % --- marker + label ---
-    hMan = scatter(ax, mp.x, mp.y, 52, 'o', 'MarkerFaceColor',cfg.colors.manual, ...
+    % --- Manual point marker + label ---
+    hMan = scatter(ax, mp.x, mp.y, 20, 'o', 'MarkerFaceColor',cfg.colors.manual, ...
         'MarkerEdgeColor','k', 'LineWidth',1.0, 'DisplayName', mp.label);
 
     dx = 0.01 * max(1, range_nonempty(x_ord(good)));
     text(ax, mp.x + dx, mp.y, ['  ' mp.label], ...
-        'Interpreter','none','FontSize',10, 'FontWeight','bold', ...
-        'Color',[0.60 0 0], 'VerticalAlignment','bottom');
+         'Interpreter','none','FontSize',12, 'FontWeight','normal', ...
+         'FontName','Helvetica', ...
+         'Color','k', 'VerticalAlignment','bottom');
+
 end
 
 % Labels for non-flats
@@ -152,18 +167,26 @@ if cfg.label_nonflats && any(maskN)
     nn = titles_ord(maskN); xn = x_ord(maskN); yn = Y_ord(maskN);
     for k = 1:numel(xn)
         if strlength(nn(k)) > 0
-            text(ax, xn(k)+dx, yn(k), char(nn(k)), ...
-                'Interpreter','none','FontSize',12, ...
-                'VerticalAlignment','middle','Color',[0.05 0.05 0.05]);
+        text(ax, xn(k)+dx, yn(k), char(nn(k)), ...
+             'Interpreter','none','FontSize',12, ...
+             'FontName',' Helvetica', ...
+             'VerticalAlignment','middle','Color',[0.05 0.05 0.05]);
+
         end
     end
 end
 
-xlabel(ax, 'Median geothermal heat flow (mW m^{-2})','Interpreter','tex','FontSize',cfg.fonts.label);
-ylabel(ax, metric_label(cfg.metric), 'Interpreter','tex','FontSize',cfg.fonts.label);
+xlabel(ax, 'Mean GHF (mW m^{-2})', ...
+       'Interpreter','tex','FontSize',cfg.fonts.label, ...
+       'FontName', cfg.fonts.name);
+
+ylabel(ax, metric_label(cfg.metric), ...
+       'Interpreter','tex','FontSize',cfg.fonts.label, ...
+       'FontName', cfg.fonts.name);
+
 ylim(ax,[0 1]); grid(ax,'on'); grid(ax,'minor'); set(ax,'FontSize',cfg.fonts.axis);
 
-% legend
+% Robust legend building (only include handles that exist)
 Lh = []; Ltxt = {};
 if ~isempty(hMan) && isgraphics(hMan)
     Lh(end+1)   = hMan; 
@@ -216,15 +239,20 @@ ok = true;
 end
 
 function X = resolve_model_medians_robust(S)
+% Preferred order:
+% 1) S.model_cvals_median
+% 2) S.model_quantiles.q50
+% 3) S.model_cvals (means)
+% 4) compute from S.models or S.models_ds (if present)
 
-if isfield(S,'model_cvals_median') && ~isempty(S.model_cvals_median)
-    X = S.model_cvals_median(:); return;
-end
-if isfield(S,'model_quantiles') && isstruct(S.model_quantiles) ...
-        && isfield(S.model_quantiles,'q50') && ~isempty(S.model_quantiles.q50)
-    X = S.model_quantiles.q50(:); return;
-end
-if isfield(S,'model_cvals') && ~isempty(S.model_cvals) % model mean
+% if isfield(S,'model_cvals_median') && ~isempty(S.model_cvals_median)
+%     X = S.model_cvals_median(:); return;
+% end
+% if isfield(S,'model_quantiles') && isstruct(S.model_quantiles) ...
+%         && isfield(S.model_quantiles,'q50') && ~isempty(S.model_quantiles.q50)
+%     X = S.model_quantiles.q50(:); return;
+% end
+if isfield(S,'model_cvals') && ~isempty(S.model_cvals)
     X = S.model_cvals(:); return;
 end
 
@@ -252,6 +280,8 @@ end
 end
 
 function draw_ci_errorbars(ax, x, y, ylo, yhi, varargin)
+% Vertical CIs (whiskers on Y) at X positions.
+
 p = inputParser;
 addParameter(p,'Color',[0 0 0],@isnumeric);
 addParameter(p,'CapSize',6,@isnumeric);
@@ -263,6 +293,7 @@ parse(p, varargin{:});
 C  = p.Results.Color; cs = p.Results.CapSize; lw = p.Results.LineW;
 useBand = p.Results.Band; A = p.Results.Alpha; XSpan = p.Results.XSpan;
 
+% Use provided XSpan if given; else try XLim; else fall back to data span
 if ~isempty(XSpan)
     xr = XSpan;
 else
@@ -280,6 +311,7 @@ for k = 1:numel(x)
     if ~(isfinite(x(k)) && isfinite(y(k)) && isfinite(ylo(k)) && isfinite(yhi(k))), continue; end
     if ylo(k) > yhi(k), [ylo(k), yhi(k)] = deal(yhi(k), ylo(k)); end
 
+    % band first so whiskers/caps sit on top
     if useBand
         xv = [x(k)-bandHalf, x(k)+bandHalf, x(k)+bandHalf, x(k)-bandHalf];
         yv = [ylo(k),        ylo(k),        yhi(k),        yhi(k)];
@@ -310,7 +342,7 @@ function s = metric_label(m)
 m = string(m);
 switch m
     case "G_raw"
-        s = 'G-mean (global REC×SPEC, bootstrapped)';
+        s = 'Performance metric';
     case "REC_raw"
         s = 'Recall (all sinks, bootstrapped)';
     case "SPEC_raw"
@@ -321,12 +353,14 @@ switch m
         s = 'Precision (all sinks, bootstrapped)';
     case "F1_raw"
         s = 'F1 score (all sinks, bootstrapped)';
+
+    % ---- NEW regional metrics ----
     case "REC_ISPB_wet_raw"
         s = 'Recall of wet sinks in ISPB (bootstrapped)';
     case "REC_OSPB_dry_raw"
         s = 'Recall of dry sinks in OSPB (bootstrapped)';
     case "G_ISPBwet_OSPBdry_raw"
-        s = 'G-mean: ISPB wet recall × OSPB dry recall (bootstrapped)';
+        s = 'Performance metric';
 
     otherwise
         s = char(m);
@@ -334,6 +368,10 @@ end
 end
 
 function [xq, yq] = build_flat_trend(x, y)
+% Build a smooth, monotone-in-x trend for flat models
+% - Sorts & uniques x
+% - Applies a gentle moving-median denoise if enough points
+% - Interpolates with 'pchip' to a dense grid for a smooth dashed line
     xq = []; yq = [];
     ok = isfinite(x) & isfinite(y);
     x  = x(ok); y = y(ok);
@@ -342,8 +380,9 @@ function [xq, yq] = build_flat_trend(x, y)
     [xs, idx] = sort(x); ys = y(idx);
     [xu, ia]  = unique(xs, 'stable'); yu = ys(ia);
 
+    % gentle smoothing only if lots of flats; otherwise just use yu
     if numel(xu) >= 5
-        w = max(3, round(numel(xu)/8));                
+        w = max(3, round(numel(xu)/8));                % gentle smoothing
         yu_s = movmedian(yu, w, 'omitnan');
     else
         yu_s = yu;
@@ -353,4 +392,39 @@ function [xq, yq] = build_flat_trend(x, y)
     yq = interp1(xu, yu_s, xq, 'pchip', 'extrap');
 end
 
+function draw_hci_errorbars(ax, x, y, xlo, xhi, varargin)
+% Horizontal CIs (whiskers on X) at Y position.
+p = inputParser;
+addParameter(p,'Color',[0 0 0],@isnumeric);
+addParameter(p,'CapSize',6,@isnumeric);
+addParameter(p,'LineW',1.0,@isnumeric);
+addParameter(p,'Band',false,@islogical);
+addParameter(p,'Alpha',0.25,@isnumeric);
+parse(p, varargin{:});
+C = p.Results.Color; cs = p.Results.CapSize; lw = p.Results.LineW;
+useBand = p.Results.Band; A = p.Results.Alpha;
 
+% derive small widths in data units (for cap height)
+yr = diff(get(ax,'YLim')); if yr<=0 || ~isfinite(yr), yr = 1; end
+capHalf = (cs/200) * yr;       % cap half-height in data units
+bandHalf= 0.0025 * yr;         % thin band thickness
+
+if ~(isfinite(x) && isfinite(y) && isfinite(xlo) && isfinite(xhi)), return; end
+if xlo > xhi, tmp=xlo; xlo=xhi; xhi=tmp; end
+
+% main horizontal whisker
+line(ax, [xlo xhi], [y y], 'Color', C, 'LineWidth', lw);
+
+% caps
+if cs > 0
+    line(ax, [xlo xlo], [y-capHalf y+capHalf], 'Color', C, 'LineWidth', lw);
+    line(ax, [xhi xhi], [y-capHalf y+capHalf], 'Color', C, 'LineWidth', lw);
+end
+
+% optional skinny band
+if useBand
+    xv = [xlo, xhi, xhi, xlo];
+    yv = [y-bandHalf, y-bandHalf, y+bandHalf, y+bandHalf];
+    patch('Parent',ax,'XData',xv,'YData',yv,'FaceColor',C,'FaceAlpha',A,'EdgeColor','none');
+end
+end

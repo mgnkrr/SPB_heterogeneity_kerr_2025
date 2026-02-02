@@ -1,6 +1,7 @@
 %%% Process GHF Models (auto-CRS, unit-aware, orientation-safe) %%%
 
 clearvars; close all;
+addpath('/Users/megankerr/Documents/Location-oldest-ice/data_ipics');
 
 %% ------------------ Toggles ------------------
 doModels = struct( ...
@@ -11,19 +12,21 @@ doModels = struct( ...
     'Martos',   true, ...
     'Shen',     true, ...
     'Losing',   true, ...
+    'Haeger',   true, ...   
+    'Lucazeau', true, ...
     'save',     true ...
 );
 
 %% ------------------ Target grid (EPSG:3031) ------------------
-tgrid = load('datasets_for_gmin/coldex_icethk.mat','Xgrid','Ygrid');
+tgrid = load('coldex_icethk.mat','Xgrid','Ygrid');
 Xgrid = tgrid.Xgrid;
 Ygrid = tgrid.Ygrid;     % meters, EPSG:3031
 proj  = projcrs(3031);
 
-qa_outdir = fullfile('datasets_for_gmin','qa_maps');
+qa_outdir = fullfile('qa_maps');
 if ~exist(qa_outdir,'dir'), mkdir(qa_outdir); end
 
-%% ------------------ Helpers ------------------
+%% ------------------ Helpers ------------------he
 function Zs = ensure_grid_shape(Z, xv, yv)
     % Try to coerce Z to [numel(yv) x numel(xv)], otherwise return Z unchanged.
     ny = numel(yv); nx = numel(xv);
@@ -37,7 +40,6 @@ function Zs = ensure_grid_shape(Z, xv, yv)
     end
 
     % If neither matches exactly, clip to the common extents safely.
-    % This avoids index-out-of-bounds when some files have padding rows/cols.
     cy = min(zy, ny); cx = min(zx, nx);
     warning('ensure_grid_shape: size mismatch (Z=%dx%d vs axes=%dx%d). Clipping to %dx%d.', ...
         zy, zx, ny, nx, cy, cx);
@@ -50,7 +52,7 @@ function z = to_mW_if_W(filename, varname, z)
     s = lower(string(u));
     if contains(s,'w') && ~contains(s,'mw')
         z = z * 1000;  % W/m^2 -> mW/m^2
-        fprintf('[units] %s:%s converted W→mW\n', filename, varname);
+        fprintf('[units] %s:%s converted W->mW\n', filename, varname);
     else
         fprintf('[units] %s:%s assumed mW\n', filename, varname);
     end
@@ -58,7 +60,7 @@ end
 
 function A = clean_grid(A, file, varname)
     fv = []; mv = [];
-    try fv = ncreadatt(file, varname, '_FillValue');   catch, end
+    try fv = ncreadatt(file, varname, '_FillValue');    catch, end
     try mv = ncreadatt(file, varname, 'missing_value'); catch, end
     bad = [];
     if isnumeric(fv), bad = [bad; fv(:)]; end
@@ -72,7 +74,6 @@ end
 % ---------- AUTO CRS / UNITS DETECTION ----------
 function [mode, ux, uy] = detect_axis_mode(file, xname, yname, xv, yv)
 % mode ∈ {'degrees','meters','kilometers','unknown'}
-    %mode = 'unknown'; 
     ux=''; uy='';
     try ux = lower(string(ncreadatt(file, xname, 'units'))); catch, end
     try uy = lower(string(ncreadatt(file, yname, 'units'))); catch, end
@@ -121,11 +122,10 @@ function [xv_m, yv_m, decided] = normalize_axes_units(file, xname, yname, xv, yv
             xv_m = xv; yv_m = yv;  % degrees for now (project later)
         case 'kilometers'
             xv_m = xv * 1000; yv_m = yv * 1000;
-            fprintf('[axes] %s:(%s,%s) km→m\n', file, xname, yname);
-        otherwise % meters or unknown→assume meters
+            fprintf('[axes] %s:(%s,%s) km->m\n', file, xname, yname);
+        otherwise % meters or unknown->assume meters
             xv_m = xv; yv_m = yv;
     end
-    % Log decision (only once)
     fprintf('[axes] %s:(%s,%s) detected=%s (ux="%s", uy="%s")\n', ...
         file, xname, yname, string(decided), string(ux), string(uy));
 end
@@ -149,17 +149,45 @@ function [xps,yps] = to3031(xv, yv, assume_deg, proj)
     end
 end
 
-function [F, kept, frac, nfin] = make_interpolant(x, y, z)
+function [F, kept, frac, nfin] = make_interpolant(x, y, z, varargin)
+%MAKE_INTERPOLANT Build scatteredInterpolant robustly.
+% Optional: make_interpolant(x,y,z,'dedup',true/false)
+%   dedup=true  -> remove duplicate (x,y) with unique (slower, safest)
+%   dedup=false -> skip unique (fast; fine for most gridded sources)
+
+    p = inputParser;
+    % addParameter(p,'dedup',true,@(v)islogical(v)||ismember(v,[0 1]));
+    parse(p,varargin{:});
+    % doDedup = logical(p.Results.dedup);
+
+    % Ensure column vectors
+    x = x(:); y = y(:); z = z(:);
+
+    % Keep only finite triplets
     Mfin = isfinite(x) & isfinite(y) & isfinite(z);
     x = x(Mfin); y = y(Mfin); z = z(Mfin);
     nfin = numel(x);
-    if nfin==0
+
+    if nfin == 0
         warning('No finite points for interpolant. Returning empty.');
         F = []; kept = 0; frac = 0; return;
     end
-    [xyu, ia] = unique([x(:) y(:)], 'rows', 'stable');
-    F = scatteredInterpolant(xyu(:,1), xyu(:,2), z(ia), 'linear', 'none');
-    kept = numel(ia); frac = kept / nfin;
+
+    % scatteredInterpolant needs double
+    x = double(x); y = double(y); z = double(z);
+
+    % if doDedup
+    %     Remove duplicate XYs (safest, slower)
+    %     [xyu, ia] = unique([x y], 'rows', 'stable');
+    %     F = scatteredInterpolant(xyu(:,1), xyu(:,2), z(ia), 'linear', 'none');
+    %     kept = numel(ia);
+    %     frac = kept / nfin;
+    % else
+        % Fast path (no dedup)
+        F = scatteredInterpolant(x, y, z, 'linear', 'none');
+        kept = nfin;
+        frac = 1;
+    %end
 end
 
 function qa_map(Z, Xgrid, Ygrid, titleStr, out_png)
@@ -170,16 +198,14 @@ function qa_map(Z, Xgrid, Ygrid, titleStr, out_png)
           min(Z(:),[],'omitnan'), max(Z(:),[],'omitnan'), nnz(isfinite(Z)), numel(Z)));
     xlabel('X (m, EPSG:3031)'); ylabel('Y (m, EPSG:3031)');
     try exportgraphics(gcf, out_png, 'Resolution', 180); catch, end
-    close all;
 end
 
 function qa_hist(Z, titleStr, out_png)
     z = Z(isfinite(Z));
     figure('Color','w'); histogram(z, 100);
     title(sprintf('%s — histogram (n=%d)', titleStr, numel(z)));
-    xlabel('mW m^{-2}'); ylabel('count');
+    xlabel('value'); ylabel('count');
     try exportgraphics(gcf, out_png, 'Resolution', 180); catch, end
-    close all;
 end
 
 function coverage_check(name, xps, yps, Xgrid, Ygrid)
@@ -189,7 +215,7 @@ function coverage_check(name, xps, yps, Xgrid, Ygrid)
         name, nnz(in), numel(in), 100*nnz(in)/numel(in));
 end
 
-% Source-map helpers (same as previous answer; omitted here for brevity)
+% Source-map helpers
 function qa_map_rect_source(xv, yv, Z, assume_deg, proj, titleStr, out_png)
     % Coerce size
     Zc = ensure_grid_shape(Z, xv, yv);
@@ -245,95 +271,110 @@ function qa_map_scatter_source(x, y, z, assume_deg, proj, titleStr, out_png)
     figure('Color','w'); scatter(xps, yps, 6, z, 'filled'); axis equal tight; colorbar;
     title(sprintf('%s (SOURCE native → EPSG:3031)\n[min=%.3g max=%.3g finite=%d]', ...
         titleStr, min(z,[],'omitnan'), max(z,[],'omitnan'), numel(z)));
-    xlabel('X (m)'); ylabel('Y (m)'); try exportgraphics(gcf, out_png, 'Resolution', 220); catch, end
+    xlabel('X (m)'); ylabel('Y (m)');
+    try exportgraphics(gcf, out_png, 'Resolution', 220); catch, end
 end
 
 %% ------------------ Stål (EPSG:3031; Q,U in W m^-2) ------------------
 if doModels.Stal
-    stal_file = 'data_ipics/aq1_01_20.nc';
+    stal_file = 'aq1_01_20.nc';
     HF_stal   = ncread(stal_file,'Q');        % W/m^2
     UNC_stal  = ncread(stal_file,'U');        % W/m^2 (σ)
     x_stal    = ncread(stal_file,'X');        % meters (EPSG:3031)
     y_stal    = ncread(stal_file,'Y');
-    
+
     HF_stal  = HF_stal * 1000;
     HF_stal = flipud(HF_stal);
     HF_stal = rot90(HF_stal, -1);
-    
+
     UNC_stal = UNC_stal * 1000;
     UNC_stal = flipud(UNC_stal);
     UNC_stal = rot90(UNC_stal, -1);
-    
+
     % Auto-detect axes (should be meters)
     [XS_stal, YS_stal, decided_stal] = to3031_auto(stal_file, 'X', 'Y', x_stal, y_stal, proj);
     qa_map_rect_source(x_stal, y_stal, HF_stal, strcmp(decided_stal,'degrees'), proj, ...
         'GHF Stal (SOURCE)', fullfile(qa_outdir,'SRC_GHF_Stal.png'));
     qa_map_rect_source(x_stal, y_stal, UNC_stal, strcmp(decided_stal,'degrees'), proj, ...
         'UNC Stal σ (SOURCE)', fullfile(qa_outdir,'SRC_UNC_Stal.png'));
-    
+
     [F_stal, keptS, fracS, nfinS]   = make_interpolant(XS_stal(:), YS_stal(:), HF_stal(:));
     [U_stal, keptSU, fracSU, nfinSU]= make_interpolant(XS_stal(:), YS_stal(:), UNC_stal(:));
     fprintf('[Stal] mean kept=%d/%.0f%% finite=%d | unc kept=%d/%.0f%% finite=%d\n', ...
         keptS, 100*fracS, nfinS, keptSU, 100*fracSU, nfinSU);
     coverage_check('Stal', XS_stal, YS_stal, Xgrid, Ygrid);
-    
+
     GHF_Stal_interp = F_stal(Xgrid, Ygrid);
     UNC_Stal_interp = U_stal(Xgrid, Ygrid);
     qa_map(GHF_Stal_interp, Xgrid, Ygrid, 'GHF Stal (mW m^{-2})', fullfile(qa_outdir,'map_GHF_Stal.png'));
     qa_hist(GHF_Stal_interp, 'GHF Stal', fullfile(qa_outdir,'hist_GHF_Stal.png'));
     qa_map(UNC_Stal_interp, Xgrid, Ygrid, 'UNC Stal (σ, mW m^{-2})', fullfile(qa_outdir,'map_UNC_Stal.png'));
     qa_hist(UNC_Stal_interp, 'UNC Stal (σ)', fullfile(qa_outdir,'hist_UNC_Stal.png'));
+
+    % --- Topo correction ---
+    if doTopo && ~isempty(Delta_topo)
+        GHF_Stal_interp_corr = GHF_Stal_interp .* (1 + Delta_topo);
+        topoStats(end+1) = topo_change_stats(GHF_Stal_interp, GHF_Stal_interp_corr, roiMask, 'Stal'); 
+        qa_map(GHF_Stal_interp_corr - GHF_Stal_interp, Xgrid, Ygrid, 'Stal: corrected - original (mW m^{-2})', fullfile(qa_outdir,'map_Stal_dAbs.png'));
+        qa_map(100*(GHF_Stal_interp_corr - GHF_Stal_interp)./GHF_Stal_interp, Xgrid, Ygrid, 'Stal: percent change (%)', fullfile(qa_outdir,'map_Stal_dPct.png'));
+    end
 end
 
 %% ------------------ Hazzard mean ------------------
 if doModels.Hazzard
-    haz_mean_file = 'data_ipics/HR24_GHF_mean_PS.grd';
+    haz_mean_file = 'HR24_GHF_mean_PS.grd';
     HF_haz = ncread(haz_mean_file,'z');
-    x_haz = ncread(haz_mean_file,'x');  
-    y_haz = ncread(haz_mean_file,'y');   
-    
+    x_haz = ncread(haz_mean_file,'x');
+    y_haz = ncread(haz_mean_file,'y');
+
     HF_haz = to_mW_if_W(haz_mean_file,'z',HF_haz);
     HF_haz = clean_grid(HF_haz, haz_mean_file, 'z');
     HF_haz = flipud(HF_haz);
     HF_haz = rot90(HF_haz, -1);
-    
+
     [x_hazg, y_hazg] = meshgrid(x_haz*1000, y_haz*1000);
-    
+
     [F_haz, ~, ~] = make_interpolant(x_hazg(:), y_hazg(:), HF_haz(:));
     GHF_Hazzard_interp = F_haz(Xgrid, Ygrid);
-    
+
     % === Std: already EPSG:3031 (km) ===
-    haz_std_file = 'data_ipics/HR24_GHF_std_PS.grd';
+    haz_std_file = 'HR24_GHF_std_PS.grd';
     SD_haz = ncread(haz_std_file,'z');
-    
+
     SD_haz = flipud(SD_haz);
     SD_haz = rot90(SD_haz, -1);
 
     x_haz2 = ncread(haz_std_file,'x');   % km
     y_haz2 = ncread(haz_std_file,'y');   % km
-    
-    % convert to meters for consistency
+
     [x_haz2g, y_haz2g] = meshgrid(x_haz2*1000, y_haz2*1000);
-    
+
     SD_haz = to_mW_if_W(haz_std_file,'z',SD_haz);
     SD_haz = clean_grid(SD_haz, haz_std_file, 'z');
-    
+
     [F_haz_std, kept_std, frac_std] = make_interpolant(x_haz2g(:), y_haz2g(:), SD_haz(:));
     UNC_Hazzard_interp = F_haz_std(Xgrid, Ygrid);
-    
-    fprintf('[Hazzard] mean=lat/lon projected, std=EPSG:3031 (km→m), kept=%d (%.2f%%)\n', ...
+
+    fprintf('[Hazzard] mean=lat/lon projected, std=EPSG:3031 (km->m), kept=%d (%.2f%%)\n', ...
         kept_std, 100*frac_std);
-    
-    % QA plots
+
     qa_map(GHF_Hazzard_interp, Xgrid, Ygrid, 'GHF Hazzard (mW m^{-2})', fullfile(qa_outdir,'map_GHF_Hazzard.png'));
     qa_hist(GHF_Hazzard_interp, 'GHF Hazzard', fullfile(qa_outdir,'hist_GHF_Hazzard.png'));
     qa_map(UNC_Hazzard_interp, Xgrid, Ygrid, 'UNC Hazzard (σ, mW m^{-2})', fullfile(qa_outdir,'map_UNC_Hazzard.png'));
     qa_hist(UNC_Hazzard_interp, 'UNC Hazzard (σ)', fullfile(qa_outdir,'hist_UNC_Hazzard.png'));
+
+    % --- Topo correction ---
+    if doTopo && ~isempty(Delta_topo)
+        GHF_Hazzard_interp_corr = GHF_Hazzard_interp .* (1 + Delta_topo);
+        topoStats(end+1) = topo_change_stats(GHF_Hazzard_interp, GHF_Hazzard_interp_corr, roiMask, 'Hazzard'); 
+        qa_map(GHF_Hazzard_interp_corr - GHF_Hazzard_interp, Xgrid, Ygrid, 'Hazzard: corrected - original (mW m^{-2})', fullfile(qa_outdir,'map_Hazzard_dAbs.png'));
+        qa_map(100*(GHF_Hazzard_interp_corr - GHF_Hazzard_interp)./GHF_Hazzard_interp, Xgrid, Ygrid, 'Hazzard: percent change (%)', fullfile(qa_outdir,'map_Hazzard_dPct.png'));
+    end
 end
 
 %% ------------------ An ------------------
 if doModels.An
-    an_file = 'data_ipics/AN1-HF.grd';
+    an_file = 'AN1-HF.grd';
     HF_an = ncread(an_file,'z');
     x_an  = ncread(an_file,'lon'); y_an = ncread(an_file,'lat');
     HF_an = to_mW_if_W(an_file,'z',HF_an);
@@ -349,103 +390,133 @@ if doModels.An
     end
 
     [lon_an, lat_an] = meshgrid(x_an, y_an);
-    
-    % Project to EPSG:3031 (expects lat, lon as same-sized arrays)
+
     [Xps_an, Yps_an] = projfwd(proj, lat_an, lon_an);
-    
-    % Interpolant to your target grid
+
     [F_an, ~, ~] = make_interpolant(Xps_an(:), Yps_an(:), HF_an(:));
     GHF_An_interp = F_an(Xgrid, Ygrid);
 
     qa_map(GHF_An_interp, Xgrid, Ygrid, 'GHF An (mW m^{-2})', fullfile(qa_outdir,'map_GHF_An.png'));
     qa_hist(GHF_An_interp, 'GHF An', fullfile(qa_outdir,'hist_GHF_An.png'));
-end   
+
+    % --- Topo correction ---
+    if doTopo && ~isempty(Delta_topo)
+        GHF_An_interp_corr = GHF_An_interp .* (1 + Delta_topo);
+        topoStats(end+1) = topo_change_stats(GHF_An_interp, GHF_An_interp_corr, roiMask, 'An'); 
+        qa_map(GHF_An_interp_corr - GHF_An_interp, Xgrid, Ygrid, 'An: corrected - original (mW m^{-2})', fullfile(qa_outdir,'map_An_dAbs.png'));
+        qa_map(100*(GHF_An_interp_corr - GHF_An_interp)./GHF_An_interp, Xgrid, Ygrid, 'An: percent change (%)', fullfile(qa_outdir,'map_An_dPct.png'));
+    end
+end
 
 %% ------------------ Fox Maule ------------------
 if doModels.FoxMaule
-    fox_file = 'data_ipics/fox_maule-hfmag.grd';
+    fox_file = 'fox_maule-hfmag.grd';
     HF_fox = ncread(fox_file,'z');
     x_fox  = ncread(fox_file,'x'); y_fox = ncread(fox_file,'y');
     HF_fox = to_mW_if_W(fox_file,'z',HF_fox);
 
     HF_fox = flipud(HF_fox);
     HF_fox = rot90(HF_fox, -1);
-    
+
     [X_fox_ps, Y_fox_ps, decided_fox] = to3031_auto(fox_file, 'x','y', x_fox, y_fox, proj);
     qa_map_rect_source(x_fox, y_fox, HF_fox, strcmp(decided_fox,'degrees'), proj, ...
         'GHF FoxMaule (SOURCE)', fullfile(qa_outdir,'SRC_GHF_FoxMaule.png'));
-    
+
     [F_fox, keptF, fracF, nfinF] = make_interpolant(X_fox_ps(:), Y_fox_ps(:), HF_fox(:));
     fprintf('[FoxMaule] kept=%d/%.0f%% finite=%d (axes=%s)\n', keptF, 100*fracF, nfinF, decided_fox);
     coverage_check('FoxMaule', X_fox_ps, Y_fox_ps, Xgrid, Ygrid);
-    
+
     GHF_FoxMaule_interp = F_fox(Xgrid, Ygrid);
     qa_map(GHF_FoxMaule_interp, Xgrid, Ygrid, 'GHF FoxMaule (mW m^{-2})', fullfile(qa_outdir,'map_GHF_FoxMaule.png'));
     qa_hist(GHF_FoxMaule_interp, 'GHF FoxMaule', fullfile(qa_outdir,'hist_GHF_FoxMaule.png'));
+
+    % --- Topo correction ---
+    if doTopo && ~isempty(Delta_topo)
+        GHF_FoxMaule_interp_corr = GHF_FoxMaule_interp .* (1 + Delta_topo);
+        topoStats(end+1) = topo_change_stats(GHF_FoxMaule_interp, GHF_FoxMaule_interp_corr, roiMask, 'FoxMaule'); 
+        qa_map(GHF_FoxMaule_interp_corr - GHF_FoxMaule_interp, Xgrid, Ygrid, 'FoxMaule: corrected - original (mW m^{-2})', fullfile(qa_outdir,'map_FoxMaule_dAbs.png'));
+        qa_map(100*(GHF_FoxMaule_interp_corr - GHF_FoxMaule_interp)./GHF_FoxMaule_interp, Xgrid, Ygrid, 'FoxMaule: percent change (%)', fullfile(qa_outdir,'map_FoxMaule_dPct.png'));
+    end
 end
 
 %% ------------------ Martos (XYZ, EPSG:3031 assumed) ------------------
 if doModels.Martos
-    martos = readmatrix('data_ipics/Martos_GHF.xyz', 'FileType', 'text');
+    martos = readmatrix('Martos_GHF.xyz', 'FileType', 'text');
     xm = martos(:,1); ym = martos(:,2); zm = martos(:,3);
     qa_map_scatter_source(xm, ym, zm, false, proj, 'GHF Martos (SOURCE)', fullfile(qa_outdir,'SRC_GHF_Martos.png'));
     [F_martos, keptM, fracM, nfinM] = make_interpolant(xm, ym, zm);
     fprintf('[Martos] kept=%d/%.0f%% finite=%d\n', keptM, 100*fracM, nfinM);
     coverage_check('Martos mean', xm, ym, Xgrid, Ygrid);
-    
+
     GHF_Martos_interp = F_martos(Xgrid, Ygrid);
     qa_map(GHF_Martos_interp, Xgrid, Ygrid, 'GHF Martos (mW m^{-2})', fullfile(qa_outdir,'map_GHF_Martos.png'));
     qa_hist(GHF_Martos_interp, 'GHF Martos', fullfile(qa_outdir,'hist_GHF_Martos.png'));
-    
-    martos_unc = readmatrix('data_ipics/Antarctic_GHF_uncertainty.xyz', 'FileType', 'text');
+
+    martos_unc = readmatrix('Antarctic_GHF_uncertainty.xyz', 'FileType', 'text');
     xmu = martos_unc(:,1); ymu = martos_unc(:,2); zu = martos_unc(:,3);
     qa_map_scatter_source(xmu, ymu, zu, false, proj, 'UNC Martos σ (SOURCE)', fullfile(qa_outdir,'SRC_UNC_Martos.png'));
     [U_martos, keptMU, fracMU, nfinMU] = make_interpolant(xmu, ymu, zu);
     fprintf('[Martos σ] kept=%d/%.0f%% finite=%d\n', keptMU, 100*fracMU, nfinMU);
     coverage_check('Martos σ', xmu, ymu, Xgrid, Ygrid);
-    
+
     UNC_Martos_interp = U_martos(Xgrid, Ygrid);
     qa_map(UNC_Martos_interp, Xgrid, Ygrid, 'UNC Martos (σ, mW m^{-2})', fullfile(qa_outdir,'map_UNC_Martos.png'));
     qa_hist(UNC_Martos_interp, 'UNC Martos (σ)', fullfile(qa_outdir,'hist_UNC_Martos.png'));
+
+    % --- Topo correction ---
+    if doTopo && ~isempty(Delta_topo)
+        GHF_Martos_interp_corr = GHF_Martos_interp .* (1 + Delta_topo);
+        topoStats(end+1) = topo_change_stats(GHF_Martos_interp, GHF_Martos_interp_corr, roiMask, 'Martos'); 
+        qa_map(GHF_Martos_interp_corr - GHF_Martos_interp, Xgrid, Ygrid, 'Martos: corrected - original (mW m^{-2})', fullfile(qa_outdir,'map_Martos_dAbs.png'));
+        qa_map(100*(GHF_Martos_interp_corr - GHF_Martos_interp)./GHF_Martos_interp, Xgrid, Ygrid, 'Martos: percent change (%)', fullfile(qa_outdir,'map_Martos_dPct.png'));
+    end
 end
 
 %% ------------------ Shen (XYZ lon/lat) ------------------
 if doModels.Shen
-    shen = readmatrix('data_ipics/shen.hf.v1.xyz', 'FileType', 'text');
+    shen = readmatrix('shen.hf.v1.xyz', 'FileType', 'text');
     lonS = shen(:,1); latS = shen(:,2); zS = shen(:,3);
     qa_map_scatter_source(lonS, latS, zS, true, proj, 'GHF Shen (SOURCE)', fullfile(qa_outdir,'SRC_GHF_Shen.png'));
     [xpsS, ypsS] = projfwd(proj, latS, lonS);
     [F_shen, keptSh, fracSh, nfinSh] = make_interpolant(xpsS, ypsS, zS);
     fprintf('[Shen] kept=%d/%.0f%% finite=%d\n', keptSh, 100*fracSh, nfinSh);
     coverage_check('Shen mean', xpsS, ypsS, Xgrid, Ygrid);
-    
+
     GHF_Shen_interp = F_shen(Xgrid, Ygrid);
     qa_map(GHF_Shen_interp, Xgrid, Ygrid, 'GHF Shen (mW m^{-2})', fullfile(qa_outdir,'map_GHF_Shen.png'));
     qa_hist(GHF_Shen_interp, 'GHF Shen', fullfile(qa_outdir,'hist_GHF_Shen.png'));
-    
-    shen_std = readmatrix('data_ipics/shen.unhf.v1.xyz', 'FileType','text');
+
+    shen_std = readmatrix('shen.unhf.v1.xyz', 'FileType','text');
     lonSu = shen_std(:,1); latSu = shen_std(:,2); zSu = shen_std(:,3);
     qa_map_scatter_source(lonSu, latSu, zSu, true, proj, 'UNC Shen σ (SOURCE)', fullfile(qa_outdir,'SRC_UNC_Shen.png'));
     [xpsSu, ypsSu] = projfwd(proj, latSu, lonSu);
     [STD_shen, keptShU, fracShU, nfinShU] = make_interpolant(xpsSu, ypsSu, zSu);
     fprintf('[Shen σ] kept=%d/%.0f%% finite=%d\n', keptShU, 100*fracShU, nfinShU);
     coverage_check('Shen σ', xpsSu, ypsSu, Xgrid, Ygrid);
-    
+
     UNC_Shen_interp = STD_shen(Xgrid, Ygrid);
     qa_map(UNC_Shen_interp, Xgrid, Ygrid, 'UNC Shen (σ, mW m^{-2})', fullfile(qa_outdir,'map_UNC_Shen.png'));
     qa_hist(UNC_Shen_interp, 'UNC Shen (σ)', fullfile(qa_outdir,'hist_UNC_Shen.png'));
+
+    % --- Topo correction ---
+    if doTopo && ~isempty(Delta_topo)
+        GHF_Shen_interp_corr = GHF_Shen_interp .* (1 + Delta_topo);
+        topoStats(end+1) = topo_change_stats(GHF_Shen_interp, GHF_Shen_interp_corr, roiMask, 'Shen'); 
+        qa_map(GHF_Shen_interp_corr - GHF_Shen_interp, Xgrid, Ygrid, 'Shen: corrected - original (mW m^{-2})', fullfile(qa_outdir,'map_Shen_dAbs.png'));
+        qa_map(100*(GHF_Shen_interp_corr - GHF_Shen_interp)./GHF_Shen_interp, Xgrid, Ygrid, 'Shen: percent change (%)', fullfile(qa_outdir,'map_Shen_dPct.png'));
+    end
 end
 
 %% ------------------ Losing (CSV lon/lat mean + min/max) ------------------
 if doModels.Losing
-    losing_tbl = readtable('data_ipics/HF_Min_Max_MaxAbs-1.csv');
+    losing_tbl = readtable('HF_Min_Max_MaxAbs-1.csv');
     lonL = losing_tbl{:,1}; latL = losing_tbl{:,2};
     zL   = losing_tbl{:,3}; zLmin = losing_tbl{:,4}; zLmax = losing_tbl{:,5};
-    
+
     qa_map_scatter_source(lonL, latL, zL, true, proj, 'GHF Losing (SOURCE)',  fullfile(qa_outdir,'SRC_GHF_Losing.png'));
     qa_map_scatter_source(lonL, latL, zLmin, true, proj, 'BMIN Losing (SOURCE)', fullfile(qa_outdir,'SRC_BMIN_Losing.png'));
     qa_map_scatter_source(lonL, latL, zLmax, true, proj, 'BMAX Losing (SOURCE)', fullfile(qa_outdir,'SRC_BMAX_Losing.png'));
-    
+
     [xpsL, ypsL] = projfwd(proj, latL, lonL);
     [F_L, keptL, fracL, nfinL] = make_interpolant(xpsL, ypsL, zL);
     [F_Lmin, keptLmin, fracLmin, nfinLmin] = make_interpolant(xpsL, ypsL, zLmin);
@@ -453,7 +524,7 @@ if doModels.Losing
     fprintf('[Losing] mean kept=%d/%.0f%%; min kept=%d/%.0f%%; max kept=%d/%.0f%%\n', ...
         keptL, 100*fracL, keptLmin, 100*fracLmin, keptLmax, 100*fracLmax);
     coverage_check('Losing mean', xpsL, ypsL, Xgrid, Ygrid);
-    
+
     GHF_Losing_interp  = F_L(Xgrid, Ygrid);
     BMIN_Losing_interp = F_Lmin(Xgrid, Ygrid);
     BMAX_Losing_interp = F_Lmax(Xgrid, Ygrid);
@@ -461,11 +532,121 @@ if doModels.Losing
     qa_hist(GHF_Losing_interp, 'GHF Losing', fullfile(qa_outdir,'hist_GHF_Losing.png'));
     qa_map(BMIN_Losing_interp, Xgrid, Ygrid, 'Losing MIN (mW m^{-2})', fullfile(qa_outdir,'map_BMIN_Losing.png'));
     qa_map(BMAX_Losing_interp, Xgrid, Ygrid, 'Losing MAX (mW m^{-2})', fullfile(qa_outdir,'map_BMAX_Losing.png'));
+
+    % --- Topo correction (mean only) ---
+    if doTopo && ~isempty(Delta_topo)
+        GHF_Losing_interp_corr = GHF_Losing_interp .* (1 + Delta_topo);
+        topoStats(end+1) = topo_change_stats(GHF_Losing_interp, GHF_Losing_interp_corr, roiMask, 'Losing'); 
+        qa_map(GHF_Losing_interp_corr - GHF_Losing_interp, Xgrid, Ygrid, 'Losing: corrected - original (mW m^{-2})', fullfile(qa_outdir,'map_Losing_dAbs.png'));
+        qa_map(100*(GHF_Losing_interp_corr - GHF_Losing_interp)./GHF_Losing_interp, Xgrid, Ygrid, 'Losing: percent change (%)', fullfile(qa_outdir,'map_Losing_dPct.png'));
+    end
+end
+
+%% ------------------ Haeger (TXT, EPSG:3031 X/Y) ------------------
+if doModels.Haeger
+    haeg_file = '2022-002_Haeger-et-al_HFSurface.txt';
+
+    % Columns: X, Y (EPSG:3031, km), HF, Std HF
+    H = readmatrix(haeg_file);
+
+    x_hg   = H(:,1) * 1000;
+    y_hg   = H(:,2) * 1000;
+    HF_hg  = H(:,3);
+    SD_hg  = H(:,4);
+
+    fprintf('[Haeger] N=%d points\n', numel(HF_hg));
+    fprintf('[Haeger] bbox X=[%.0f, %.0f], Y=[%.0f, %.0f]\n', ...
+        min(x_hg), max(x_hg), min(y_hg), max(y_hg));
+    fprintf('[Target] bbox X=[%.0f, %.0f], Y=[%.0f, %.0f]\n', ...
+        min(Xgrid(1,:)), max(Xgrid(1,:)), min(Ygrid(:,1)), max(Ygrid(:,1)));
+
+    % Units: TXT has no metadata; assume already mW/m^2 and just log that
+    HF_hg = to_mW_if_W(haeg_file, 'HF', HF_hg);
+    SD_hg = to_mW_if_W(haeg_file, 'StdHF', SD_hg);
+
+    qa_map_scatter_source(x_hg, y_hg, HF_hg, false, proj, ...
+        'GHF Haeger (SOURCE)', fullfile(qa_outdir,'SRC_GHF_Haeger.png'));
+    qa_map_scatter_source(x_hg, y_hg, SD_hg, false, proj, ...
+        'UNC Haeger σ (SOURCE)', fullfile(qa_outdir,'SRC_UNC_Haeger.png'));
+
+    [F_hg, keptHg, fracHg, nfinHg] = make_interpolant(x_hg, y_hg, HF_hg);
+    [U_hg, keptHgU, fracHgU, nfinHgU] = make_interpolant(x_hg, y_hg, SD_hg);
+
+    fprintf('[Haeger mean] kept=%d/%.1f%% finite=%d\n', keptHg, 100*fracHg, nfinHg);
+    fprintf('[Haeger σ]   kept=%d/%.1f%% finite=%d\n', keptHgU, 100*fracHgU, nfinHgU);
+
+    coverage_check('Haeger mean', x_hg, y_hg, Xgrid, Ygrid);
+
+    GHF_Haeger_interp = F_hg(Xgrid, Ygrid);
+    UNC_Haeger_interp = U_hg(Xgrid, Ygrid);
+
+    qa_map(GHF_Haeger_interp, Xgrid, Ygrid, ...
+        'GHF Haeger (mW m^{-2})', fullfile(qa_outdir,'map_GHF_Haeger.png'));
+    qa_hist(GHF_Haeger_interp, 'GHF Haeger', ...
+        fullfile(qa_outdir,'hist_GHF_Haeger.png'));
+
+    qa_map(UNC_Haeger_interp, Xgrid, Ygrid, ...
+        'UNC Haeger (σ, mW m^{-2})', fullfile(qa_outdir,'map_UNC_Haeger.png'));
+    qa_hist(UNC_Haeger_interp, 'UNC Haeger (σ)', ...
+        fullfile(qa_outdir,'hist_UNC_Haeger.png'));
+
+    % --- Topo correction ---
+    if doTopo && ~isempty(Delta_topo)
+        GHF_Haeger_interp_corr = GHF_Haeger_interp .* (1 + Delta_topo);
+        topoStats(end+1) = topo_change_stats(GHF_Haeger_interp, GHF_Haeger_interp_corr, roiMask, 'Haeger'); 
+        qa_map(GHF_Haeger_interp_corr - GHF_Haeger_interp, Xgrid, Ygrid, 'Haeger: corrected - original (mW m^{-2})', fullfile(qa_outdir,'map_Haeger_dAbs.png'));
+        qa_map(100*(GHF_Haeger_interp_corr - GHF_Haeger_interp)./GHF_Haeger_interp, Xgrid, Ygrid, 'Haeger: percent change (%)', fullfile(qa_outdir,'map_Haeger_dPct.png'));
+    end
+end
+
+%% ------------------ Lucazeau (CSV lon/lat, HF + sHF) ------------------
+if doModels.Lucazeau
+    luc_file = 'HFgrid14.csv';
+
+    luc_tbl = readtable(luc_file);
+    lonLz = luc_tbl{:,1};
+    latLz = luc_tbl{:,2};
+    HF_Lz = luc_tbl{:,3};
+    sHF_Lz = luc_tbl{:,4};
+
+    qa_map_scatter_source(lonLz, latLz, HF_Lz, true, proj, ...
+        'GHF Lucazeau (SOURCE)', fullfile(qa_outdir,'SRC_GHF_Lucazeau.png'));
+    qa_map_scatter_source(lonLz, latLz, sHF_Lz, true, proj, ...
+        'UNC Lucazeau σ (SOURCE)', fullfile(qa_outdir,'SRC_UNC_Lucazeau.png'));
+
+    [xpsLz, ypsLz] = projfwd(proj, latLz, lonLz);
+    [F_Lz, keptLz, fracLz, nfinLz]     = make_interpolant(xpsLz, ypsLz, HF_Lz);
+    [U_Lz, keptLzU, fracLzU, nfinLzU]  = make_interpolant(xpsLz, ypsLz, sHF_Lz);
+
+    fprintf('[Lucazeau] mean kept=%d/%.0f%% finite=%d | σ kept=%d/%.0f%% finite=%d\n', ...
+        keptLz, 100*fracLz, nfinLz, keptLzU, 100*fracLzU, nfinLzU);
+    coverage_check('Lucazeau mean', xpsLz, ypsLz, Xgrid, Ygrid);
+
+    GHF_Lucazeau_interp = F_Lz(Xgrid, Ygrid);
+    UNC_Lucazeau_interp = U_Lz(Xgrid, Ygrid);
+
+    qa_map(GHF_Lucazeau_interp, Xgrid, Ygrid, 'GHF Lucazeau (mW m^{-2})', ...
+        fullfile(qa_outdir,'map_GHF_Lucazeau.png'));
+    qa_hist(GHF_Lucazeau_interp, 'GHF Lucazeau', ...
+        fullfile(qa_outdir,'hist_GHF_Lucazeau.png'));
+
+    qa_map(UNC_Lucazeau_interp, Xgrid, Ygrid, 'UNC Lucazeau (σ, mW m^{-2})', ...
+        fullfile(qa_outdir,'map_UNC_Lucazeau.png'));
+    qa_hist(UNC_Lucazeau_interp, 'UNC Lucazeau (σ)', ...
+        fullfile(qa_outdir,'hist_UNC_Lucazeau.png'));
+
+    % --- Topo correction ---
+    if doTopo && ~isempty(Delta_topo)
+        GHF_Lucazeau_interp_corr = GHF_Lucazeau_interp .* (1 + Delta_topo);
+        topoStats(end+1) = topo_change_stats(GHF_Lucazeau_interp, GHF_Lucazeau_interp_corr, roiMask, 'Lucazeau'); 
+        qa_map(GHF_Lucazeau_interp_corr - GHF_Lucazeau_interp, Xgrid, Ygrid, 'Lucazeau: corrected - original (mW m^{-2})', fullfile(qa_outdir,'map_Lucazeau_dAbs.png'));
+        qa_map(100*(GHF_Lucazeau_interp_corr - GHF_Lucazeau_interp)./GHF_Lucazeau_interp, Xgrid, Ygrid, 'Lucazeau: percent change (%)', fullfile(qa_outdir,'map_Lucazeau_dPct.png'));
+    end
 end
 
 %% ------------------ Save everything to datasets_for_gmin/ (+ GeoTIFFs) ------------------
 if doModels.save
-    outdir = 'datasets_for_gmin/';
+    outdir = 'datasets_for_gmin';
     if ~exist(outdir,'dir'), mkdir(outdir); end
 
     %% Means (MAT + GeoTIFF)
@@ -474,11 +655,21 @@ if doModels.save
         write_geotiff_epsg3031(fullfile(outdir,'GHF_Stal_interp.tif'), ...
             GHF_Stal_interp, Xgrid, Ygrid);
     end
+    if exist('GHF_Stal_interp_corr','var')
+        save(fullfile(outdir,'GHF_Stal_interp_corr.mat'), 'GHF_Stal_interp_corr');
+        write_geotiff_epsg3031(fullfile(outdir,'GHF_Stal_interp_corr.tif'), ...
+            GHF_Stal_interp_corr, Xgrid, Ygrid);
+    end
 
     if exist('GHF_Hazzard_interp','var')
         save(fullfile(outdir,'GHF_Hazzard_interp.mat'), 'GHF_Hazzard_interp');
         write_geotiff_epsg3031(fullfile(outdir,'GHF_Hazzard_interp.tif'), ...
             GHF_Hazzard_interp, Xgrid, Ygrid);
+    end
+    if exist('GHF_Hazzard_interp_corr','var')
+        save(fullfile(outdir,'GHF_Hazzard_interp_corr.mat'), 'GHF_Hazzard_interp_corr');
+        write_geotiff_epsg3031(fullfile(outdir,'GHF_Hazzard_interp_corr.tif'), ...
+            GHF_Hazzard_interp_corr, Xgrid, Ygrid);
     end
 
     if exist('GHF_An_interp','var')
@@ -486,11 +677,21 @@ if doModels.save
         write_geotiff_epsg3031(fullfile(outdir,'GHF_An_interp.tif'), ...
             GHF_An_interp, Xgrid, Ygrid);
     end
+    if exist('GHF_An_interp_corr','var')
+        save(fullfile(outdir,'GHF_An_interp_corr.mat'), 'GHF_An_interp_corr');
+        write_geotiff_epsg3031(fullfile(outdir,'GHF_An_interp_corr.tif'), ...
+            GHF_An_interp_corr, Xgrid, Ygrid);
+    end
 
     if exist('GHF_Martos_interp','var')
         save(fullfile(outdir,'GHF_Martos_interp.mat'), 'GHF_Martos_interp');
         write_geotiff_epsg3031(fullfile(outdir,'GHF_Martos_interp.tif'), ...
             GHF_Martos_interp, Xgrid, Ygrid);
+    end
+    if exist('GHF_Martos_interp_corr','var')
+        save(fullfile(outdir,'GHF_Martos_interp_corr.mat'), 'GHF_Martos_interp_corr');
+        write_geotiff_epsg3031(fullfile(outdir,'GHF_Martos_interp_corr.tif'), ...
+            GHF_Martos_interp_corr, Xgrid, Ygrid);
     end
 
     if exist('GHF_Shen_interp','var')
@@ -498,17 +699,54 @@ if doModels.save
         write_geotiff_epsg3031(fullfile(outdir,'GHF_Shen_interp.tif'), ...
             GHF_Shen_interp, Xgrid, Ygrid);
     end
+    if exist('GHF_Shen_interp_corr','var')
+        save(fullfile(outdir,'GHF_Shen_interp_corr.mat'), 'GHF_Shen_interp_corr');
+        write_geotiff_epsg3031(fullfile(outdir,'GHF_Shen_interp_corr.tif'), ...
+            GHF_Shen_interp_corr, Xgrid, Ygrid);
+    end
 
     if exist('GHF_Losing_interp','var')
         save(fullfile(outdir,'GHF_Losing_interp.mat'), 'GHF_Losing_interp');
         write_geotiff_epsg3031(fullfile(outdir,'GHF_Losing_interp.tif'), ...
             GHF_Losing_interp, Xgrid, Ygrid);
     end
+    if exist('GHF_Losing_interp_corr','var')
+        save(fullfile(outdir,'GHF_Losing_interp_corr.mat'), 'GHF_Losing_interp_corr');
+        write_geotiff_epsg3031(fullfile(outdir,'GHF_Losing_interp_corr.tif'), ...
+            GHF_Losing_interp_corr, Xgrid, Ygrid);
+    end
 
     if exist('GHF_FoxMaule_interp','var')
         save(fullfile(outdir,'GHF_FoxMaule_interp.mat'), 'GHF_FoxMaule_interp');
         write_geotiff_epsg3031(fullfile(outdir,'GHF_FoxMaule_interp.tif'), ...
             GHF_FoxMaule_interp, Xgrid, Ygrid);
+    end
+    if exist('GHF_FoxMaule_interp_corr','var')
+        save(fullfile(outdir,'GHF_FoxMaule_interp_corr.mat'), 'GHF_FoxMaule_interp_corr');
+        write_geotiff_epsg3031(fullfile(outdir,'GHF_FoxMaule_interp_corr.tif'), ...
+            GHF_FoxMaule_interp_corr, Xgrid, Ygrid);
+    end
+
+    if exist('GHF_Haeger_interp','var')
+        save(fullfile(outdir,'GHF_Haeger_interp.mat'), 'GHF_Haeger_interp');
+        write_geotiff_epsg3031(fullfile(outdir,'GHF_Haeger_interp.tif'), ...
+            GHF_Haeger_interp, Xgrid, Ygrid);
+    end
+    if exist('GHF_Haeger_interp_corr','var')
+        save(fullfile(outdir,'GHF_Haeger_interp_corr.mat'), 'GHF_Haeger_interp_corr');
+        write_geotiff_epsg3031(fullfile(outdir,'GHF_Haeger_interp_corr.tif'), ...
+            GHF_Haeger_interp_corr, Xgrid, Ygrid);
+    end
+
+    if exist('GHF_Lucazeau_interp','var')
+        save(fullfile(outdir,'GHF_Lucazeau_interp.mat'), 'GHF_Lucazeau_interp');
+        write_geotiff_epsg3031(fullfile(outdir,'GHF_Lucazeau_interp.tif'), ...
+            GHF_Lucazeau_interp, Xgrid, Ygrid);
+    end
+    if exist('GHF_Lucazeau_interp_corr','var')
+        save(fullfile(outdir,'GHF_Lucazeau_interp_corr.mat'), 'GHF_Lucazeau_interp_corr');
+        write_geotiff_epsg3031(fullfile(outdir,'GHF_Lucazeau_interp_corr.tif'), ...
+            GHF_Lucazeau_interp_corr, Xgrid, Ygrid);
     end
 
     %% Uncertainties / bounds (MAT + GeoTIFF)
@@ -548,6 +786,18 @@ if doModels.save
             BMAX_Losing_interp, Xgrid, Ygrid);
     end
 
+    if exist('UNC_Haeger_interp','var')
+        save(fullfile(outdir,'UNC_Haeger_interp.mat'), 'UNC_Haeger_interp');
+        write_geotiff_epsg3031(fullfile(outdir,'UNC_Haeger_interp.tif'), ...
+            UNC_Haeger_interp, Xgrid, Ygrid);
+    end
+
+    if exist('UNC_Lucazeau_interp','var')
+        save(fullfile(outdir,'UNC_Lucazeau_interp.mat'), 'UNC_Lucazeau_interp');
+        write_geotiff_epsg3031(fullfile(outdir,'UNC_Lucazeau_interp.tif'), ...
+            UNC_Lucazeau_interp, Xgrid, Ygrid);
+    end
+
     fprintf('All interpolated grids saved as MAT + GeoTIFF in %s\n', outdir);
     fprintf('All QA maps (source + target) saved in %s\n', qa_outdir);
 end
@@ -563,40 +813,28 @@ function write_geotiff_epsg3031(filename, Z, Xgrid, Ygrid, nodataVal)
         nodataVal = -9999;
     end
 
-    % Replace NaN/Inf with nodata
     Zout = Z;
     bad = ~isfinite(Zout);
     Zout(bad) = nodataVal;
 
-    % Assume regular grid; use first row/column as 1D axes
     xv = Xgrid(1, :);
     yv = Ygrid(:, 1);
 
     dx = median(diff(xv), 'omitnan');
     dy = median(diff(yv), 'omitnan');
 
-    % Cell-edge world limits (half-cell padding)
     xmin = min(xv) - dx/2;
     xmax = max(xv) + dx/2;
     ymin = min(yv) - dy/2;
     ymax = max(yv) + dy/2;
 
-    % Build spatial referencing object
     R = maprefcells([xmin xmax], [ymin ymax], size(Zout));
 
-    % Try to make rows start from south (y increasing upward),
-    % but don't die if this MATLAB version doesn't like it.
     try
         R.RowsStartFrom = 'south';
     catch
-        % leave default
     end
 
-    % DO NOT touch ColumnsStartFrom here — some versions are picky.
-    % Just use whatever default maprefcells gave us.
-
-    % Write GeoTIFF (EPSG:3031)
     geotiffwrite(filename, Zout, R, 'CoordRefSysCode', 3031);
     fprintf('[GeoTIFF] wrote %s (EPSG:3031, nodata=%g)\n', filename, nodataVal);
 end
-

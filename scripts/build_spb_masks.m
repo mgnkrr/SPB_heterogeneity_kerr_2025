@@ -1,6 +1,10 @@
 function build_spb_masks()
+% BUILD_SPB_MASKS (verbose)
+% - Crops to rectangle before any inpolygon
+% - Logs timings, sizes, counts
+% - Saves either cropped or full masks (cropped by default, much smaller)
 
-%% ------------------ make her verbose ------------------
+%% ------------------ Verbose helpers ------------------
 t0 = tic;
 memMB = @() struct2table(whos, 'AsArray',true).bytes'/1024/1024;
 function logf(fmt, varargin), fprintf(['[build_spb_masks] ' fmt '\n'], varargin{:}); end
@@ -8,13 +12,14 @@ function logf(fmt, varargin), fprintf(['[build_spb_masks] ' fmt '\n'], varargin{
 logf('Start');
 
 %% ------------------ Config ------------------
-cfg.rect = struct('enable',true,'xlim',[0 700],'ylim',[-200 350],'rects',[],'mode','include');
-sparseThreshold = 0.10;   
+cfg.rect = struct('enable',true,'xlim',[-200 800],'ylim',[-200 400],'rects',[],'mode','include');
+useCroppedSave = true;    % save only cropped masks + indices (smaller, faster)
+sparseThreshold = 0.10;   % save as sparse if nnz < 10%
 
 %% ------------------ Grid ------------------
 t = tic;
-G = load('datasets/coldex_icethk.mat','Xgrid','Ygrid','H');
-Xgrid = G.Xgrid; Ygrid = G.Ygrid; 
+G = load('datasets_for_gmin/coldex_icethk.mat','Xgrid','Ygrid','H');
+Xgrid = G.Xgrid; Ygrid = G.Ygrid; % H unused for masks; keep memory light
 clear G
 X_km = Xgrid/1000; Y_km = Ygrid/1000;
 logf('Loaded grid: %dx%d (%.1f MB)', size(X_km,1), size(X_km,2), sum(memMB()));
@@ -38,9 +43,9 @@ logf('Rect build time: %.2f s', toc(t));
 
 %% ------------------ Read shapefiles ------------------
 t = tic;
-S_spb  = shaperead('datasets/spb_merged.shp');
-S_ispb = shaperead('datasets/inner_spb.shp');
-S_ospb = shaperead('datasets/outer_spb.shp');
+S_spb  = shaperead('datasets_for_gmin/spb_merged.shp');
+S_ispb = shaperead('datasets_for_gmin/inner_spb.shp');
+S_ospb = shaperead('datasets_for_gmin/outer_spb.shp');
 log_parts = @(S) sum(arrayfun(@(k) numel(S(k).X), 1:numel(S)));
 logf('Loaded shapes: SPB parts=%d verts=%d | ISPB parts=%d verts=%d | OSPB parts=%d verts=%d', ...
      numel(S_spb),  log_parts(S_spb), ...
@@ -48,7 +53,8 @@ logf('Loaded shapes: SPB parts=%d verts=%d | ISPB parts=%d verts=%d | OSPB parts
      numel(S_ospb), log_parts(S_ospb));
 logf('Shapefile load time: %.2f s', toc(t));
 
-%% ------------------ Build masks ------------------
+%% ------------------ Build masks (on CROPPED grid) ------------------
+% We'll OR-accumulate per part. (You can switch to concat->single call if desired.)
 mask_SPB_c  = false(size(Xc));
 mask_ISPB_c = false(size(Xc));
 mask_OSPB_c = false(size(Xc));
@@ -80,31 +86,36 @@ for i = 1:numel(S_ospb)
 end
 logf('OSPB mask crop nnz=%d (%.3f%%) | time %.2f s', nnz(mask_OSPB_c), 100*nnz(mask_OSPB_c)/numel(mask_OSPB_c), toc(t));
 
-%% ------------------ Stitch to full size ----------
+%% ------------------ Stitch to full size (for QA / optional save) ----------
 mask_SPB  = false(size(X_km));  mask_SPB( rmin:rmax, cmin:cmax) = mask_SPB_c;
 mask_ISPB = false(size(X_km));  mask_ISPB(rmin:rmax, cmin:cmax) = mask_ISPB_c;
 mask_OSPB = false(size(X_km));  mask_OSPB(rmin:rmax, cmin:cmax) = mask_OSPB_c;
 
 logf('Full-size nnz: SPB=%d ISPB=%d OSPB=%d', nnz(mask_SPB), nnz(mask_ISPB), nnz(mask_OSPB));
 
-%% ------------------ Save --------------------------
-outdir  = 'datasets';
+%% ------------------ Save (cropped or full) --------------------------
+outdir  = 'datasets_for_gmin';
 if ~exist(outdir,'dir'), mkdir(outdir); end
 outfile = fullfile(outdir,'spb_masks.mat');
 
 t = tic;
+if useCroppedSave
+    % Save cropped masks + indices (smallest). Use sparse if very few trues.
+    tosparse = @(A) (nnz(A) < sparseThreshold*numel(A));
+    if tosparse(mask_SPB_c),  mask_SPB_c  = sparse(mask_SPB_c);  end
+    if tosparse(mask_ISPB_c), mask_ISPB_c = sparse(mask_ISPB_c); end
+    if tosparse(mask_OSPB_c), mask_OSPB_c = sparse(mask_OSPB_c); end
+    % rect_mask is usually dense — keep dense for simplicity.
+    save(outfile, 'mask_SPB_c','mask_ISPB_c','mask_OSPB_c', ...
+                  'rect_mask','rmin','rmax','cmin','cmax','-v7.3');
+    logf('Saved CROPPED masks → %s (%.2f s).', outfile, toc(t));
+    logf('To reconstruct full masks later, stitch with rmin/rmax/cmin/cmax.');
+else
+    %save(outfile, 'mask_SPB','mask_ISPB','mask_OSPB','rect_mask','-v7');
+    %logf('Saved FULL masks → %s (%.2f s).', outfile, toc(t));
+end
 
-tosparse = @(A) (nnz(A) < sparseThreshold*numel(A));
-if tosparse(mask_SPB_c),  mask_SPB_c  = sparse(mask_SPB_c);  end
-if tosparse(mask_ISPB_c), mask_ISPB_c = sparse(mask_ISPB_c); end
-if tosparse(mask_OSPB_c), mask_OSPB_c = sparse(mask_OSPB_c); end
-
-save(outfile, 'mask_SPB_c','mask_ISPB_c','mask_OSPB_c', ...
-              'rect_mask','rmin','rmax','cmin','cmax','-v7.3');
-logf('Saved CROPPED masks → %s (%.2f s).', outfile, toc(t));
-logf('To reconstruct full masks later, stitch with rmin/rmax/cmin/cmax.');
-
-%% ------------------ Show me ------------------------------
+%% ------------------ Quick QA figure ------------------------------
 try
     t = tic;
     fig = figure('Visible','off','Color','w','Position',[100 100 900 800]);
@@ -126,7 +137,7 @@ end
 
 % ================= Helpers =================
 function M = build_rect_mask(X_km, Y_km, rectCfg)
-    M = true(size(X_km));  
+    M = true(size(X_km));  % default all pass
     if nargin<3 || ~isstruct(rectCfg), return; end
     if ~isfield(rectCfg,'enable') || ~rectCfg.enable, return; end
     if isfield(rectCfg,'rects') && ~isempty(rectCfg.rects)

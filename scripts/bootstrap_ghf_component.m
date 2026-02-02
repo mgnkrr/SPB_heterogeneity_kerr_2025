@@ -44,7 +44,7 @@ cfg.skip_static_build = true;
 cfg.uncertainty = struct( ...
   'mode','analytic', ...
   'bootstrap_mode','component', ...    % 'pixel' | 'component'
-  'n_boot',1000, ...
+  'n_boot',10, ...
   'seed',42, ...
   'mfrac',0.7, ...
   'band_main',0.95, ...
@@ -66,12 +66,17 @@ if ~exist(cfg.outdir,'dir'), mkdir(cfg.outdir); end
 
 % =========================== Load data ===========================
 fprintf('Loading data ...\n');
-datafile = fullfile('datasets_for_gmin','gmin_data.mat');
-if exist(datafile,'file')
+datafile = '/disk/kea/WAIS/home/wais/users/mek/gmin_code/for_pub/datasets/gmin_data.mat';
+
+if exist(datafile,'file') == 2
     fprintf('[bootstrap] Loading %s ... ', datafile);
-    L = load(datafile,'S'); S = L.S; clear L; fprintf('ok.\n');
+    L = load(datafile,'S');
+    S = L.S;
+    clear L;
+    fprintf('ok.\n');
 else
     warning('Data file not found. Building now...');
+
     S = build_data_core('to_single',true,'save',true, ...
                     'outdir','datasets','outfile','gmin_data.mat');
     S = add_g_fields(fullfile('datasets','gmin_data.mat'), ...
@@ -97,8 +102,25 @@ fprintf('[bootstrap] Grid: %dx%d | models: %d\n', size(S.Xgrid,1), size(S.Xgrid,
 nM = numel(S.names); S.model_cvals = nan(nM,1);
 
 %% =========================== Load SPB masks ===========================
-datafile = fullfile('datasets_for_gmin','spb_masks.mat');
-if exist(datafile,'file'), m = load(datafile); else, build_spb_masks(); m = load(datafile); end
+script_dir  = fileparts(mfilename('fullpath'));
+dataset_dir = fullfile(script_dir, 'datasets');
+if ~exist(dataset_dir,'dir'), mkdir(dataset_dir); end
+
+datafile = fullfile(dataset_dir, 'spb_masks.mat');
+
+if exist(datafile,'file') == 2
+    m = load(datafile);
+else
+    old = pwd;
+    cd(script_dir);          % so build_spb_masks() saves to script_dir/datasets/...
+    build_spb_masks();
+    cd(old);
+
+    if exist(datafile,'file') ~= 2
+        error('build_spb_masks() did not create expected file: %s', datafile);
+    end
+    m = load(datafile);
+end
 
 S.mask_ISPB = false(size(S.Xgrid));
 S.mask_OSPB = false(size(S.Xgrid));
@@ -109,30 +131,62 @@ S.mask_OSPB(m.rmin:m.rmax, m.cmin:m.cmax) = logical(full(m.mask_OSPB_c));
 S.mask_SPB( m.rmin:m.rmax, m.cmin:m.cmax) = logical(full(m.mask_SPB_c));
 S.rect_mask = logical(m.rect_mask);
 
-switch lower(cfg.region.mode)
-  case 'ispb',  REG_MASK = S.mask_ISPB & S.rect_mask;
-  case 'ospb',  REG_MASK = S.mask_OSPB & S.rect_mask;
-  case 'spb',   REG_MASK = S.mask_SPB  & S.rect_mask;
-  case 'all',   REG_MASK = S.rect_mask;
-  otherwise,    error('cfg.region.mode must be ISPB | OSPB | SPB | ALL');
-end
+% switch lower(cfg.region.mode)
+%   case 'ispb',  REG_MASK = S.mask_ISPB & S.rect_mask;
+%   case 'ospb',  REG_MASK = S.mask_OSPB & S.rect_mask;
+%   case 'spb',   REG_MASK = S.mask_SPB  & S.rect_mask;
+%   case 'all',   REG_MASK = S.rect_mask;
+%   otherwise,    error('cfg.region.mode must be ISPB | OSPB | SPB | ALL');
+% end
 
 %% ========== ROI masks (sinks + slow flow + region) ==========
-if exist('datasets_for_gmin/sink_mask_new.mat','file')==2 && exist('datasets_for_gmin/sink_mask_comp.mat','file')==2
-    t = load('datasets_for_gmin/sink_mask_new.mat', 'sink_mask'); S.sink_mask = t.sink_mask; clear t;    
-    t = load('datasets_for_gmin/sink_mask_comp.mat', 'comp_id','sink_mask_comp'); 
+if exist('/disk/kea/WAIS/home/wais/users/mek/gmin_code/for_pub/datasets/sink_mask_new.mat','file')==2 && exist('/disk/kea/WAIS/home/wais/users/mek/gmin_code/for_pub/datasets/sink_mask_comp.mat','file')==2
+    t = load('/disk/kea/WAIS/home/wais/users/mek/gmin_code/for_pub/datasets/sink_mask_new.mat', 'sink_mask'); S.sink_mask = t.sink_mask; clear t;    
+    t = load('/disk/kea/WAIS/home/wais/users/mek/gmin_code/for_pub/datasets/sink_mask_comp.mat', 'comp_id','sink_mask_comp'); 
     S.comp_id = t.comp_id; S.sink_mask_comp = t.sink_mask_comp; clear t;
 else
     make_sink_mask();
-    t = load('datasets_for_gmin/sink_mask_new.mat', 'sink_mask'); S.sink_mask = t.sink_mask; clear t;  
-    t = load('datasets_for_gmin/sink_mask_comp.mat', 'comp_id','sink_mask_comp'); 
+    t = load('/disk/kea/WAIS/home/wais/users/mek/gmin_code/for_pub/datasets/sink_mask_new.mat', 'sink_mask'); S.sink_mask = t.sink_mask; clear t;  
+    t = load('/disk/kea/WAIS/home/wais/users/mek/gmin_code/for_pub/datasets/sink_mask_comp.mat', 'comp_id','sink_mask_comp'); 
     S.comp_id = t.comp_id; S.sink_mask_comp = t.sink_mask_comp; clear t;
 end
 
 valid_mask = isfinite(S.Q) & ~S.spec_invalid & isfinite(S.H) & isfinite(S.icevel);
 slow_mask  = valid_mask & ~(S.icevel > cfg.v_keep);
 
-S.roi_mask = slow_mask & REG_MASK & S.sink_mask_comp;   
+%% --- Build REG_MASK on the canonical grid (self-contained) ---
+% Default: full domain
+REG_MASK = true(size(S.H));
+
+% OPTION A (recommended): bounding box in km: [xmin xmax ymin ymax]
+% Example: cfg.reg_bbox_km = [-50 250 -120 160];  % <-- YOU set this
+if isfield(cfg,'reg_bbox_km') && ~isempty(cfg.reg_bbox_km)
+    b = cfg.reg_bbox_km(:).';
+    assert(numel(b)==4, 'cfg.reg_bbox_km must be [xmin xmax ymin ymax] in km');
+    xmin = b(1)*1000; xmax = b(2)*1000;
+    ymin = b(3)*1000; ymax = b(4)*1000;
+
+    REG_MASK = (S.Xgrid >= xmin & S.Xgrid <= xmax & ...
+                S.Ygrid >= ymin & S.Ygrid <= ymax);
+end
+
+% OPTION B: polygon vertices in km (overrides bbox if provided)
+% Example:
+% cfg.reg_poly_km = [x1 y1; x2 y2; ... ; xN yN];  % km
+if isfield(cfg,'reg_poly_km') && ~isempty(cfg.reg_poly_km)
+    P = cfg.reg_poly_km;
+    assert(size(P,2)==2, 'cfg.reg_poly_km must be Nx2 [x_km y_km]');
+    xv = P(:,1)*1000;  yv = P(:,2)*1000;
+    REG_MASK = inpolygon(S.Xgrid, S.Ygrid, xv, yv);
+end
+
+% Safety: always logical and correct size
+REG_MASK = logical(REG_MASK);
+assert(isequal(size(REG_MASK), size(S.H)), 'REG_MASK size mismatch');
+
+% --- Now safe ---
+S.roi_mask = slow_mask & REG_MASK & S.sink_mask_comp;
+ 
 S.viz_mask = slow_mask & REG_MASK;                      
 
 % ROI-vector indexing
@@ -177,8 +231,8 @@ end
 validNames = cellfun(@(c) matlab.lang.makeValidName(c), S.names, 'uni', 0);
 
 if ~isfield(S,'comp_id') || isempty(S.comp_id)
-    if exist('datasets_for_gmin/sink_mask_comp.mat','file')
-        tt = load('datasets_for_gmin/sink_mask_comp.mat');
+    if exist('/disk/kea/WAIS/home/wais/users/mek/gmin_code/for_pub/datasets/sink_mask_comp.mat','file')
+        tt = load('/disk/kea/WAIS/home/wais/users/mek/gmin_code/for_pub/datasets/sink_mask_comp.mat');
         if isfield(tt,'comp_id') && isequal(size(tt.comp_id), size(S.sink_mask_comp))
             S.comp_id = tt.comp_id;
         else

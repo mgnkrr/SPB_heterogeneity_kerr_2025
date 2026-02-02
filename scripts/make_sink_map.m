@@ -88,7 +88,7 @@ set(axH, 'FontName',opt.fontname, 'FontSize',opt.fontsize, ...
          'XColor','k','YColor','k');
 
 % Hide toolbar in exports
-try, axtoolbar(axH,'none'); catch, end
+try axtoolbar(axH,'none'); catch, end
 
 % Muted grayscale base
 n = 256; lo = 0.96; hi = 0.72;

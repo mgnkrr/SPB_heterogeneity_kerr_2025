@@ -1,0 +1,1065 @@
+function R = make_synthetic_GHF_MCMC_new(cfg)
+% MAKE_SYNTHETIC_GHF_MCMC_NEW (rewritten)
+%
+% Builds a synthetic geothermal heat flow (GHF) field and tunes it with a
+% single-chain random-walk Metropolis sampler to maximize a performance metric.
+%
+% Objective metric (default):
+%   Gmean = sqrt( REC * SPEC )
+%
+% Where REC and SPEC are computed from a classifier applied inside the ROI:
+%   yhat = (Gcorr - Gmin) >= decision_margin
+%
+% Major features in this rewrite:
+%   1) Weighted specularity truth (cfg.truth_mode = 'weighted'):
+%        - uses wet probability w = wfun(Sc) in [0,1]
+%        - computes EXPECTED confusion counts and expected REC/SPEC
+%      Legacy binary truth (cfg.truth_mode = 'binary') still supported.
+%
+%   2) Colgan topographic correction (unitless Delta = dG/G):
+%        - applies multiplicative correction:  Gcorr = G * (1 + Delta)
+%        - Delta is loaded/applied on the SAME target grid as Xgrid/Ygrid
+%
+% Records in chain:
+%   - params, gmean, rec, spec, logprior, posterior, accepted
+%   - G_mu_grid: whole-grid mean(Gcorr) over finite cells
+%   - G_median_specvalid: median(Gcorr) over spec-valid pixels (Q ~= 9999)
+%
+% Outputs:
+%   R.chain (table), R.keep (table), R.best (struct), R.acc_rate, etc.
+
+fprintf('\n=============================\n');
+fprintf('[make_synthetic_GHF_MCMC_new] Start (%s)\n', datetime('now'));
+fprintf('=============================\n');
+
+%% ---------------- Defaults ----------------
+if nargin < 1 || isempty(cfg), cfg = struct(); end
+
+% --- Field template ---
+cfg = set_default(cfg, 'template_mode',   'gradient');    % 'gradient' | 'randn-smoothed'
+cfg = set_default(cfg, 'sample_angle',    true);
+cfg = set_default(cfg, 'grad_angle_deg0', 30);            % used if sample_angle=false
+
+% --- MCMC knobs ---
+cfg = set_default(cfg, 'n_steps',         12000);
+cfg = set_default(cfg, 'burn_frac',       0.25);
+cfg = set_default(cfg, 'thin',            1);
+cfg = set_default(cfg, 'beta',            6);             % posterior scale on clamp01(Gmean)
+cfg = set_default(cfg, 'seed',            42);
+
+% Proposal widths
+cfg = set_default(cfg, 'step_mu',         30);
+cfg = set_default(cfg, 'step_het',        30);
+cfg = set_default(cfg, 'step_theta',      30);
+
+% Parameter supports
+cfg = set_default(cfg, 'mu_range',        [20 150]);
+cfg = set_default(cfg, 'het_range',       [-150 150]);    % A for gradient, sigma for randn-smoothed
+cfg = set_default(cfg, 'theta_range_deg', [-90 90]);
+
+% Priors
+cfg = set_default(cfg, 'prior_type',      'softbox');     % 'softbox' | 'gaussian'
+cfg = set_default(cfg, 'soft_k',          3);
+
+% ROI / evaluation knobs
+cfg = set_default(cfg, 'region_mode',     'ALL');         % 'ISPB'|'OSPB'|'SPB'|'ALL'
+cfg = set_default(cfg, 'roi_x_range',     [0 700]*1000);
+cfg = set_default(cfg, 'roi_y_range',     [-200 350]*1000);
+cfg = set_default(cfg, 'v_keep',          10);            % m/yr
+cfg = set_default(cfg, 'decision_margin', 0);             % mW/m^2
+cfg = set_default(cfg, 'proxy_gate',      0);             % delayed-acceptance proxy threshold
+
+% Truth definition
+cfg = set_default(cfg, 'truth_mode',      'binary');      % 'binary' | 'weighted'
+cfg = set_default(cfg, 'spec_thresh',     0.30);          % for binary truth only
+cfg = set_default(cfg, 'wfun', struct( ...
+    'type','linear_clip', ...   % 'linear_clip' | 'logistic'
+    'sc0', 0.20, ...
+    'sc1', 0.60, ...
+    'k',   12));
+
+% Physical gating
+cfg = set_default(cfg, 'floor_G',         20);            % mW/m^2
+cfg = set_default(cfg, 'cap_G',           100);           % mW/m^2; [] => none
+cfg = set_default(cfg, 'enforce_mean',    true);
+cfg = set_default(cfg, 'A_nonneg',        false);
+cfg = set_default(cfg, 'penalize_clip',   true);
+cfg = set_default(cfg, 'clip_k',          0.15);
+
+% Side-effects / IO
+cfg = set_default(cfg, 'skip_bootstrap',  true);
+cfg = set_default(cfg, 'outdir',          'figs_out');
+cfg = set_default(cfg, 'verbose',         true);
+
+% Map saving
+cfg = set_default(cfg, 'save_maps',       true);
+cfg = set_default(cfg, 'map_every',       1000);
+cfg = set_default(cfg, 'map_downsample',  1);
+cfg = set_default(cfg, 'export_pdf',      false);
+
+% Caching
+cfg = set_default(cfg, 'cache_round',     [0.25, 0.5, 2]); % rounding for [mu, A/sigma, theta]
+
+% Colgan topographic correction: Delta = dG/G (unitless)
+cfg = set_default(cfg, 'topocorr', struct( ...
+    'enable', false, ...
+    'mode',   'colgan_multiply', ...    % apply Gcorr = G*(1+Delta)
+    'Delta',  [], ...                  % Delta grid on target X/Y
+    'file',   '', ...                  % optional MAT file containing Delta
+    'field',  'Delta_topo'));          % field name in MAT
+
+% Sanity checks
+assert(numel(cfg.mu_range)==2 && cfg.mu_range(1) < cfg.mu_range(2), 'mu_range invalid');
+assert(numel(cfg.het_range)==2 && cfg.het_range(1) < cfg.het_range(2), 'het_range invalid');
+if strcmpi(cfg.template_mode,'gradient') && cfg.sample_angle
+    assert(numel(cfg.theta_range_deg)==2 && cfg.theta_range_deg(1) < cfg.theta_range_deg(2), 'theta_range invalid');
+end
+assert(ismember(lower(cfg.truth_mode), {'binary','weighted'}), 'truth_mode must be binary or weighted');
+
+% Output dirs / RNG
+run_id = char(datetime('now','Format','yyyyMMdd_HHmmss'));
+if ~exist(cfg.outdir,'dir'), mkdir(cfg.outdir); end
+artdir = fullfile(cfg.outdir,'artifacts'); if ~exist(artdir,'dir'), mkdir(artdir); end
+mapdir = fullfile(cfg.outdir,'maps');      if ~exist(mapdir,'dir'), mkdir(mapdir); end
+rng(cfg.seed);
+
+if cfg.verbose
+    fprintf('[config] template=%s | steps=%d | burn=%.0f%% | thin=%d | beta=%.2f | truth=%s | topo=%d\n', ...
+        cfg.template_mode, cfg.n_steps, 100*cfg.burn_frac, cfg.thin, cfg.beta, lower(cfg.truth_mode), cfg.topocorr.enable);
+end
+
+%% ---------------- Grid & static state ----------------
+S_static = build_static_state(cfg);
+X = single(S_static.Xgrid);
+Y = single(S_static.Ygrid);
+
+% Precompute gradient ramps (if needed)
+rampCache = containers.Map('KeyType','char','ValueType','any');
+if strcmpi(cfg.template_mode,'gradient')
+    th_lo = ceil(cfg.theta_range_deg(1));
+    th_hi = floor(cfg.theta_range_deg(2));
+    for th = th_lo:th_hi
+        rampCache(sprintf('th_%d', th)) = unit_gradient_angle(X, Y, th);
+    end
+end
+
+%% ---------------- Initial params & probes ----------------
+params0 = initial_params(cfg);
+fprintf('[init] params0=%s\n', fmtv(params0));
+
+probe_list = probe_params(cfg, params0);
+for i = 1:size(probe_list,1)
+    [Gtmp, pst] = build_G_from_params(X, Y, cfg, probe_list(i,:), rampCache, S_static);
+    [gmean, rec, spec, mu_grid, med_spec] = evaluate_params(Gtmp, S_static, cfg, true);
+    fprintf('[probe %d] %s -> Gmean=%.3f (REC=%.3f, SPEC=%.3f) | <G>=%.2f | med_spec(G)=%.2f\n', ...
+        i, fmtv(probe_list(i,:)), gmean, rec, spec, mu_grid, med_spec);
+    print_phys_stats('probe', pst);
+end
+
+% Evaluate initial
+[G0, pst0] = build_G_from_params(X, Y, cfg, params0, rampCache, S_static);
+[gmean0, rec0, spec0, mu_grid0, med_spec0] = evaluate_params(G0, S_static, cfg, true);
+
+lp0   = log_prior(params0, cfg);
+post0 = cfg.beta * clamp01(gmean0) + lp0;
+
+best = struct('params',params0,'gmean',gmean0,'rec',rec0,'spec',spec0,'post',post0, ...
+              'iter',1,'mu_grid',mu_grid0,'med_spec',med_spec0);
+
+fprintf('[mcmc] Start @ %s | Gmean=%.3f (REC=%.3f SPEC=%.3f) | post=%.3f | <G>=%.2f | med_spec(G)=%.2f\n', ...
+    fmtv(params0), gmean0, rec0, spec0, post0, mu_grid0, med_spec0);
+print_phys_stats('start', pst0);
+
+%% ---------------- Storage ----------------
+K = cfg.n_steps;
+Ddim = numel(params0);
+chain_params    = nan(K, Ddim);
+chain_gmean     = nan(K, 1);
+chain_lp        = nan(K, 1);
+chain_post      = nan(K, 1);
+chain_acc       = false(K,1);
+chain_gmu_grid  = nan(K,1);
+chain_gmed_spec = nan(K,1);
+
+ScoreCache = containers.Map('KeyType','char','ValueType','any'); % key -> [gmean, rec, spec, mu_grid, med_spec]
+accepts = 0;
+last_map_iter = 0;
+
+params = params0;
+
+%% ---------------- MCMC loop ----------------
+for k = 1:K
+    % Propose
+    prop = propose_params(params, cfg);
+
+    key = cache_key(prop, cfg.cache_round, cfg);
+    used_cache = false;
+
+    % Delayed-acceptance proxy
+    do_full_eval = true;
+    if cfg.proxy_gate > 0
+        [Gproxy, ~] = build_G_from_params(X, Y, cfg, prop, rampCache, S_static);
+        p_gm = proxy_gmean(Gproxy, S_static, cfg);
+        if p_gm < cfg.proxy_gate
+            do_full_eval = false;
+        end
+    end
+
+    if isKey(ScoreCache, key)
+        ss = ScoreCache(key);
+        gmean1    = ss(1);
+        rec1      = ss(2);
+        spec1     = ss(3);
+        mu_grid1  = ss(4);
+        med_spec1 = ss(5);
+        used_cache = true;
+        pst1 = [];
+    elseif do_full_eval
+        [G1, pst1] = build_G_from_params(X, Y, cfg, prop, rampCache, S_static);
+        [gmean1, rec1, spec1, mu_grid1, med_spec1] = evaluate_params(G1, S_static, cfg, false);
+        ScoreCache(key) = [gmean1, rec1, spec1, mu_grid1, med_spec1];
+    else
+        % Proxy rejected
+        gmean1 = 0; rec1=0; spec1=1; mu_grid1 = NaN; med_spec1 = NaN; pst1 = [];
+    end
+
+    lp1   = log_prior(prop, cfg);
+    post1 = cfg.beta * clamp01(gmean1) + lp1;
+
+    % MH accept
+    dpost = post1 - post0;
+    if (dpost >= 0) || (rand < exp(dpost))
+        params = prop;
+        gmean0 = gmean1; rec0 = rec1; spec0 = spec1;
+        mu_grid0 = mu_grid1; med_spec0 = med_spec1;
+        lp0 = lp1; post0 = post1;
+
+        chain_acc(k) = true;
+        accepts = accepts + 1;
+
+        if isempty(pst1) && do_full_eval
+            [~, pst1] = build_G_from_params(X, Y, cfg, params, rampCache, S_static);
+        end
+        if ~isempty(pst1), print_phys_stats(sprintf('acc %4d',k), pst1); end
+
+        if gmean0 > best.gmean
+            best = struct('params',params,'gmean',gmean0,'rec',rec0,'spec',spec0,'post',post0, ...
+                          'iter',k,'mu_grid',mu_grid0,'med_spec',med_spec0);
+
+            if cfg.save_maps && (k - last_map_iter >= cfg.map_every || k==1)
+                [GbestIter, ~] = build_G_from_params(X, Y, cfg, params, rampCache, S_static);
+                save_one_map(GbestIter, X, Y, cfg, mapdir, sprintf('BEST_iter%d',k));
+                last_map_iter = k;
+            end
+        end
+    end
+
+    % Store
+    chain_params(k,:)    = params;
+    chain_gmean(k)       = gmean0;
+    chain_lp(k)          = lp0;
+    chain_post(k)        = post0;
+    chain_gmu_grid(k)    = mu_grid0;
+    chain_gmed_spec(k)   = med_spec0;
+
+    if cfg.verbose && mod(k, max(1,round(K/20)))==0
+        fprintf('[mcmc] %4d/%4d | acc=%.1f%% | Gmean=%.3f | post=%.3f | <G>=%.2f | med_spec(G)=%.2f | params=%s%s\n', ...
+            k, K, 100*accepts/k, gmean0, post0, mu_grid0, med_spec0, fmtv(params), ternary(used_cache,' [cache]',''));
+    end
+end
+
+% Final best map
+[GbestFinal, ~] = build_G_from_params(X, Y, cfg, best.params, rampCache, S_static);
+save_one_map(GbestFinal, X, Y, cfg, mapdir, sprintf('BEST_final_iter%d', best.iter), [], true);
+qgis_save_geotiff(GbestFinal, X, Y, fullfile(mapdir, sprintf('ghf_best_%s.tif', run_id)), -9999);
+
+acc_rate = accepts / K;
+fprintf('[mcmc] Done. acc=%.1f%% | Best Gmean=%.3f @ %s (REC=%.3f SPEC=%.3f) | <G>=%.2f | med_spec(G)=%.2f\n', ...
+    100*acc_rate, best.gmean, fmtv(best.params), best.rec, best.spec, best.mu_grid, best.med_spec);
+
+%% ---------------- Post & save ----------------
+burn = max(0, round(cfg.burn_frac * K));
+keep_idx = (burn+1):cfg.thin:K;
+keep_params = chain_params(keep_idx,:);
+keep_gmean  = chain_gmean(keep_idx);
+keep_post   = chain_post(keep_idx);
+keep_mu     = chain_gmu_grid(keep_idx);
+keep_medS   = chain_gmed_spec(keep_idx);
+
+names = param_names(cfg);
+
+T_all  = array2table(chain_params, 'VariableNames', names);
+T_all.Gmean               = chain_gmean;
+T_all.LogPrior            = chain_lp;
+T_all.Posterior           = chain_post;
+T_all.Accepted            = chain_acc;
+T_all.G_mu_grid           = chain_gmu_grid;
+T_all.G_median_specvalid  = chain_gmed_spec;
+
+T_keep = array2table(keep_params, 'VariableNames', names);
+T_keep.Gmean               = keep_gmean;
+T_keep.Posterior           = keep_post;
+T_keep.G_mu_grid           = keep_mu;
+T_keep.G_median_specvalid  = keep_medS;
+
+plot_trace(chain_gmean, 'Gmean', cfg, run_id, cfg.outdir);
+for d=1:Ddim, plot_trace(chain_params(:,d), names{d}, cfg, run_id, cfg.outdir); end
+plot_posterior(keep_params, names, cfg, run_id, cfg.outdir);
+plot_pairs(keep_params, names, cfg, run_id, cfg.outdir);
+
+R = struct();
+R.mode          = 'mcmc';
+R.chain         = T_all;
+R.keep          = T_keep;
+R.best          = best;
+R.acc_rate      = acc_rate;
+R.run_id        = run_id;
+R.outdir        = cfg.outdir;
+
+% Save a compact config + static details
+R.cfg = cfg;
+R.static_summary = struct( ...
+    'truth_mode', cfg.truth_mode, ...
+    'region_mode', cfg.region_mode, ...
+    'roi_n', numel(S_static.roi_idx), ...
+    'roi_wet_frac_bin', ternary(strcmpi(cfg.truth_mode,'binary'), mean(S_static.y_bin_vec,'omitnan'), NaN), ...
+    'roi_mean_wetprob', ternary(strcmpi(cfg.truth_mode,'weighted'), mean(S_static.w_wet_vec,'omitnan'), NaN), ...
+    'topo_enabled', cfg.topocorr.enable);
+
+outfile = fullfile(artdir, sprintf('mcmc_results_%s.mat', run_id));
+save(outfile, '-struct', 'R');
+fprintf('[save] %s\n', outfile);
+fprintf('=============================\n\n');
+
+end
+
+% =====================================================================
+%                              STATIC BUILD
+% =====================================================================
+
+function S_static = build_static_state(cfg)
+
+% Allow injected S_static
+if isfield(cfg,'S_static') && ~isempty(cfg.S_static)
+    S_static = cfg.S_static;
+    assert(isfield(S_static,'Xgrid') && isfield(S_static,'Ygrid'), 'Injected S_static missing Xgrid/Ygrid');
+else
+    D = load('datasets_for_gmin/coldex_icethk.mat');
+    assert(isfield(D,'Xgrid') && isfield(D,'Ygrid'), 'Xgrid/Ygrid missing in coldex_icethk.mat');
+    L = load('datasets_for_gmin/gmin_data.mat','S');
+    S_static = L.S;
+    S_static.Xgrid = D.Xgrid;
+    S_static.Ygrid = D.Ygrid;
+end
+
+% Attach Gmin if not present
+if ~isfield(S_static,'Gmin')
+    try L2 = load('datasets_for_gmin/gmin_data.mat','Gmin'); if isfield(L2,'Gmin'), S_static.Gmin = L2.Gmin; end; catch, end %#ok<CTCH>
+end
+assert(isfield(S_static,'Gmin') && isequal(size(S_static.Gmin), size(S_static.Xgrid)), 'Gmin missing or wrong size');
+
+X = single(S_static.Xgrid);
+Y = single(S_static.Ygrid);
+
+% Masks
+Ms = load('datasets_for_gmin/spb_masks.mat');
+S_static.mask_ISPB = false(size(X)); S_static.mask_OSPB = S_static.mask_ISPB; S_static.mask_SPB = S_static.mask_ISPB;
+S_static.mask_ISPB(Ms.rmin:Ms.rmax, Ms.cmin:Ms.cmax) = logical(full(Ms.mask_ISPB_c));
+S_static.mask_OSPB(Ms.rmin:Ms.rmax, Ms.cmin:Ms.cmax) = logical(full(Ms.mask_OSPB_c));
+S_static.mask_SPB( Ms.rmin:Ms.rmax, Ms.cmin:Ms.cmax) = logical(full(Ms.mask_SPB_c));
+S_static.rect_mask = logical(Ms.rect_mask);
+
+% Validity
+if ~isfield(S_static,'spec_invalid') && isfield(S_static,'Q')
+    S_static.spec_invalid = (S_static.Q == 9999);
+end
+S_static.spec_valid_mask = isfinite(S_static.Q) & ~(S_static.Q==9999);
+
+valid_mask = isfinite(S_static.Q) & ~(S_static.Q==9999) & isfinite(S_static.H) & isfinite(S_static.icevel);
+
+% Region selection
+switch lower(cfg.region_mode)
+    case 'ispb', REG_MASK = S_static.mask_ISPB & S_static.rect_mask;
+    case 'ospb', REG_MASK = S_static.mask_OSPB & S_static.rect_mask;
+    case 'spb',  REG_MASK = S_static.mask_SPB  & S_static.rect_mask;
+    case 'all',  REG_MASK = S_static.rect_mask;
+    otherwise, error('region_mode invalid');
+end
+
+slow_mask = valid_mask & ~(S_static.icevel > cfg.v_keep);
+roi_mask  = slow_mask & REG_MASK;
+
+% Optional coordinate clamp
+if ~isempty(cfg.roi_x_range) || ~isempty(cfg.roi_y_range)
+    coord_mask = true(size(X));
+    if ~isempty(cfg.roi_x_range)
+        coord_mask = coord_mask & X >= cfg.roi_x_range(1) & X <= cfg.roi_x_range(2);
+    end
+    if ~isempty(cfg.roi_y_range)
+        coord_mask = coord_mask & Y >= cfg.roi_y_range(1) & Y <= cfg.roi_y_range(2);
+    end
+    roi_mask = roi_mask & coord_mask;
+end
+
+S_static.roi_mask = roi_mask;
+S_static.roi_idx  = find(roi_mask);
+
+% ROI specularity vector
+idx = S_static.roi_idx;
+Sc_roi = S_static.Q(idx);
+S_static.Sc_roi = Sc_roi;
+
+% Truth vectors
+S_static.y_bin_vec = isfinite(Sc_roi) & (Sc_roi ~= 9999) & (Sc_roi > cfg.spec_thresh);
+S_static.w_wet_vec = sc_to_wetprob(Sc_roi, cfg);
+
+% Region labels on ROI vector
+S_static.roi_ISPB = logical(S_static.mask_ISPB(idx));
+S_static.roi_OSPB = logical(S_static.mask_OSPB(idx));
+
+% Topographic correction Delta on target grid
+S_static.Delta_topo = [];
+if isfield(cfg,'topocorr') && cfg.topocorr.enable
+    Delta = [];
+    if isfield(cfg.topocorr,'Delta') && ~isempty(cfg.topocorr.Delta)
+        Delta = cfg.topocorr.Delta;
+    elseif isfield(cfg.topocorr,'file') && ~isempty(cfg.topocorr.file)
+        Ld = load(cfg.topocorr.file);
+        assert(isfield(Ld, cfg.topocorr.field), 'topocorr.file missing field: %s', cfg.topocorr.field);
+        Delta = Ld.(cfg.topocorr.field);
+    else
+        error('topocorr.enable=true but no Delta provided (topocorr.Delta or topocorr.file).');
+    end
+
+    assert(isequal(size(Delta), size(X)), 'Delta_topo must match Xgrid/Ygrid size');
+    S_static.Delta_topo = single(Delta);
+
+    fprintf('[topo] enabled: mode=%s | Delta finite=%.1f%% | Delta p05/p50/p95=%.3g/%.3g/%.3g\n', ...
+        cfg.topocorr.mode, 100*nnz(isfinite(S_static.Delta_topo))/numel(S_static.Delta_topo), ...
+        prctile(double(S_static.Delta_topo(isfinite(S_static.Delta_topo))),5), ...
+        prctile(double(S_static.Delta_topo(isfinite(S_static.Delta_topo))),50), ...
+        prctile(double(S_static.Delta_topo(isfinite(S_static.Delta_topo))),95));
+end
+
+% Sanity prints
+n_roi = numel(idx);
+fprintf('[check] ROI pixels=%d\n', n_roi);
+
+if strcmpi(cfg.truth_mode,'binary')
+    n_pos = nnz(S_static.y_bin_vec);
+    fprintf('[check|binary] wet=%d (%.2f%%), dry=%d (%.2f%%), spec_thresh=%.2f\n', ...
+        n_pos, 100*n_pos/max(1,n_roi), n_roi-n_pos, 100*(n_roi-n_pos)/max(1,n_roi), cfg.spec_thresh);
+else
+    w = double(S_static.w_wet_vec);
+    fprintf('[check|weighted] mean(wet_prob)=%.3f | sum(w)=%.1f | sum(1-w)=%.1f\n', ...
+        mean(w,'omitnan'), sum(w,'omitnan'), sum(1-w,'omitnan'));
+end
+
+pctGminFinite = 100*nnz(isfinite(S_static.Gmin(roi_mask)))/max(1,nnz(roi_mask));
+fprintf('[check] Gmin finite in ROI: %.1f%%\n', pctGminFinite);
+
+end
+
+% =====================================================================
+%                               BUILD FIELD
+% =====================================================================
+
+function [Gcorr, pst] = build_G_from_params(X, Y, cfg, params, rampCache, S_static)
+
+% --- Template field (raw, before topo and physical gating) ---
+switch lower(cfg.template_mode)
+    case 'gradient'
+        mu = single(params(1));
+        A  = single(params(2));
+        if cfg.A_nonneg, A = max(A,0); end
+        if cfg.sample_angle
+            th = params(3);
+        else
+            th = cfg.grad_angle_deg0;
+        end
+
+        key = sprintf('th_%d', round(th));
+        if isKey(rampCache, key)
+            U = rampCache(key);
+        else
+            U = unit_gradient_angle(X, Y, th);
+        end
+        Graw = mu + A * U;
+
+    case 'randn-smoothed'
+        mu  = single(params(1));
+        sig = max(single(params(2)), 0);
+        Z  = imgaussfilt(randn(size(X),'single'), 15);
+        Z  = standardize_Z(Z);
+        Graw = mu + sig * Z;
+
+    otherwise
+        error('Unknown template_mode: %s', cfg.template_mode);
+end
+
+% --- Colgan topo correction: Gcorr = G*(1+Delta) ---
+Gtopo = Graw;
+if isfield(cfg,'topocorr') && cfg.topocorr.enable && ~isempty(S_static.Delta_topo)
+    switch lower(cfg.topocorr.mode)
+        case 'colgan_multiply'
+            Gtopo = Graw .* (1 + S_static.Delta_topo);
+        otherwise
+            error('Unknown topocorr.mode: %s', cfg.topocorr.mode);
+    end
+end
+
+% --- Physical gating on corrected field ---
+Gm_before = mean(Gtopo(:), 'omitnan');
+
+Gcorr = Gtopo;
+if ~isempty(cfg.floor_G), Gcorr = max(Gcorr, single(cfg.floor_G)); end
+if ~isempty(cfg.cap_G),   Gcorr = min(Gcorr, single(cfg.cap_G));   end
+
+if cfg.enforce_mean
+    % recenter to target mu (params(1)) after topo+clipping
+    Gcorr = Gcorr - Gm_before + single(params(1));
+    if ~isempty(cfg.floor_G), Gcorr = max(Gcorr, single(cfg.floor_G)); end
+    if ~isempty(cfg.cap_G),   Gcorr = min(Gcorr, single(cfg.cap_G));   end
+end
+
+% stats
+[f_floor, f_cap] = physics_clip_stats(Gcorr, cfg.floor_G, cfg.cap_G, []);
+pst = struct( ...
+    'min_after',  min(Gcorr(:),[],'omitnan'), ...
+    'max_after',  max(Gcorr(:),[],'omitnan'), ...
+    'mean_after', mean(Gcorr(:),'omitnan'), ...
+    'f_floor',    f_floor, ...
+    'f_cap',      f_cap);
+
+end
+
+% =====================================================================
+%                              EVALUATION
+% =====================================================================
+
+function g = proxy_gmean(G, S_static, cfg)
+% Cheap proxy: ignores Gmin and uses median threshold on ROI values
+idx = S_static.roi_idx;
+if isempty(idx), g = 0; return; end
+
+Gi = double(G(idx));
+Gi = Gi(isfinite(Gi));
+if isempty(Gi), g = 0; return; end
+
+thr = median(Gi,'omitnan');
+yhat = Gi >= thr;
+
+% For proxy, use binary truth (it's just a gate)
+y = S_static.y_bin_vec(:);
+y = y(isfinite(y));
+
+% Align lengths if any mismatch (defensive)
+n = min(numel(y), numel(yhat));
+if n <= 0, g = 0; return; end
+y = logical(y(1:n));
+yhat = logical(yhat(1:n));
+
+[rec, spec] = local_confusion(y, yhat);
+g = clamp01(sqrt(rec*spec));
+end
+
+function [gmean, REC_all, SPEC_all, mu_grid, med_spec] = evaluate_params(G, S_static, cfg, verbose)
+% Robust evaluator using GDelta = G - Gmin inside ROI.
+
+if nargin < 4, verbose = false; end
+
+idx = S_static.roi_idx;
+assert(~isempty(idx), 'ROI is empty.');
+
+% Whole-grid mean (finite)
+Gf = G(isfinite(G));
+mu_grid = ternary(isempty(Gf), NaN, mean(Gf,'omitnan'));
+
+% Spec-valid median (finite + spec-valid)
+msv = S_static.spec_valid_mask & isfinite(G);
+gsv = double(G(msv));
+med_spec = ternary(isempty(gsv), NaN, median(gsv,'omitnan'));
+
+% ROI vectors
+g  = double(G(idx));
+gm = double(S_static.Gmin(idx));
+
+truth_mode = lower(cfg.truth_mode);
+switch truth_mode
+    case 'binary'
+        y = logical(S_static.y_bin_vec(:));
+        bad = ~isfinite(g) | ~isfinite(gm) | ~isfinite(y);
+    case 'weighted'
+        w = double(S_static.w_wet_vec(:));
+        bad = ~isfinite(g) | ~isfinite(gm) | ~isfinite(w);
+    otherwise
+        error('Unknown truth_mode: %s', cfg.truth_mode);
+end
+
+if any(bad)
+    g(bad) = []; gm(bad) = [];
+    if strcmp(truth_mode,'binary')
+        y(bad) = [];
+    else
+        w(bad) = [];
+    end
+end
+
+if isempty(g)
+    gmean=0; REC_all=0; SPEC_all=0;
+    if verbose, fprintf('[eval] empty after filtering; Gmean=0\n'); end
+    return;
+end
+
+% decision rule on GDelta
+yhat = (g - gm) >= cfg.decision_margin;
+
+% metrics
+if strcmp(truth_mode,'binary')
+    n = numel(y); npos = nnz(y); nneg = n - npos;
+    if npos==0 || nneg==0
+        gmean=0; REC_all=0; SPEC_all=0;
+        if verbose
+            fprintf('[eval|binary] degenerate classes: n=%d pos=%d neg=%d -> Gmean=0\n', n, npos, nneg);
+        end
+        return;
+    end
+    [REC_all, SPEC_all] = local_confusion(y, yhat);
+
+else
+    sw  = sum(w, 'omitnan');
+    s1w = sum(1-w, 'omitnan');
+    if sw<=0 || s1w<=0
+        gmean=0; REC_all=0; SPEC_all=0;
+        if verbose
+            fprintf('[eval|weighted] degenerate weights: sum(w)=%.3g sum(1-w)=%.3g -> Gmean=0\n', sw, s1w);
+        end
+        return;
+    end
+    [REC_all, SPEC_all] = local_confusion_weighted(w, yhat);
+end
+
+gmean = sqrt(REC_all * SPEC_all);
+
+if verbose
+    fprintf('[eval|%s] REC=%.3f SPEC=%.3f Gmean=%.3f | margin=%.2f\n', ...
+        truth_mode, REC_all, SPEC_all, gmean, cfg.decision_margin);
+end
+
+% Optional heavy bootstrap side-effect (off by default)
+if ~cfg.skip_bootstrap
+    try
+        cfg_eval = struct('synthetic_G',double(G), 'synthetic_name','MCMC', ...
+            'region',struct('mode','ALL'), 'outdir',cfg.outdir, 'run_id','', ...
+            'overwrite',true, 'S_static',S_static, 'skip_static_build',true, ...
+            'save_artifacts',false, 'uncertainty',struct('mode','analytic','n_boot',0), ...
+            'decision_margin_mode','fixed','decision_margin',cfg.decision_margin, ...
+            'residual',struct('enable',false), ...
+            'spec_thresh',cfg.spec_thresh,'v_keep',cfg.v_keep, ...
+            'eval_mask_override',S_static.roi_mask);
+        bootstrap_ghf_component(cfg_eval);
+    catch ME
+        fprintf('[bootstrap skipped] %s\n', ME.message);
+    end
+end
+
+end
+
+% =====================================================================
+%                               PROPOSAL
+% =====================================================================
+
+function p0 = initial_params(cfg)
+mu0  = 40;
+het0 = mean(cfg.het_range);
+p0 = [mu0, het0];
+if strcmpi(cfg.template_mode,'gradient') && cfg.sample_angle
+    p0 = [mu0, het0, 0];
+end
+end
+
+function P = probe_params(cfg, params0)
+% a few quick probes around start
+if numel(params0) == 3
+    P = [params0;
+         params0(1), max(cfg.het_range)*0.8, params0(3);
+         params0(1), min(cfg.het_range)*0.2, params0(3)];
+else
+    P = [params0;
+         params0(1), max(cfg.het_range)*0.8;
+         params0(1), min(cfg.het_range)*0.2];
+end
+end
+
+function prop = propose_params(params, cfg)
+prop = params;
+prop(1) = params(1) + cfg.step_mu  * randn;
+prop(2) = params(2) + cfg.step_het * randn;
+if strcmpi(cfg.template_mode,'gradient') && cfg.sample_angle
+    prop(3) = wrap_theta(params(3) + cfg.step_theta * randn, cfg.theta_range_deg);
+end
+end
+
+% =====================================================================
+%                              PRIORS
+% =====================================================================
+
+function lp = log_prior(params, cfg)
+switch lower(cfg.prior_type)
+    case 'softbox'
+        lp = -softbox_penalty(params(1), cfg.mu_range, cfg.soft_k);
+        lp = lp - softbox_penalty(params(2), cfg.het_range, cfg.soft_k);
+        if strcmpi(cfg.template_mode,'gradient') && cfg.sample_angle
+            lp = lp - softbox_penalty(params(3), cfg.theta_range_deg, cfg.soft_k);
+        end
+    case 'gaussian'
+        mu0 = mean(cfg.mu_range);  s_mu = diff(cfg.mu_range)/2;
+        h0  = mean(cfg.het_range); s_h  = diff(cfg.het_range)/2;
+        lp  = -0.5*((params(1)-mu0)/s_mu).^2 - 0.5*((params(2)-h0)/s_h).^2;
+        if strcmpi(cfg.template_mode,'gradient') && cfg.sample_angle
+            t0 = mean(cfg.theta_range_deg); s_t = diff(cfg.theta_range_deg)/2;
+            lp = lp - 0.5*((wrap_centered(params(3),t0)-t0)/s_t).^2;
+        end
+    otherwise
+        error('Unknown prior_type: %s', cfg.prior_type);
+end
+
+% optional clipping penalty (approximate)
+if isfield(cfg,'penalize_clip') && cfg.penalize_clip
+    frac_clip = approx_clip_fraction(params, cfg);
+    lp = lp - (frac_clip.^2) / max(1e-6, cfg.clip_k);
+end
+end
+
+function frac_clip = approx_clip_fraction(params, cfg)
+frac_clip = 0;
+
+if strcmpi(cfg.template_mode,'gradient')
+    mu = params(1);
+    A  = params(2); if cfg.A_nonneg, A = max(A,0); end
+    A = max(abs(A), eps);
+
+    if ~isempty(cfg.floor_G)
+        u_floor = (cfg.floor_G - mu) / A;
+        span = max(0, min(1, u_floor) - (-1));
+        frac_clip = max(frac_clip, min(1, span/2));
+    end
+    if ~isempty(cfg.cap_G)
+        u_cap = (cfg.cap_G - mu) / A;
+        span_hi = max(0, 1 - max(-1, u_cap));
+        frac_clip = max(frac_clip, min(1, span_hi/2));
+    end
+else
+    mu = params(1);
+    sig = max(params(2), 1e-6);
+    if ~isempty(cfg.floor_G)
+        zf = (cfg.floor_G - mu) / sig;
+        frac_clip = max(frac_clip, 0.5*erfc(zf / sqrt(2)));
+    end
+    if ~isempty(cfg.cap_G)
+        zc = (cfg.cap_G - mu) / sig;
+        frac_clip = max(frac_clip, 0.5*erfc(-zc / sqrt(2)));
+    end
+end
+
+end
+
+% =====================================================================
+%                             TRUTH / CONFUSION
+% =====================================================================
+
+function w = sc_to_wetprob(Sc, cfg)
+Sc = double(Sc);
+bad = ~isfinite(Sc) | (Sc==9999);
+
+wf = cfg.wfun;
+switch lower(wf.type)
+    case 'linear_clip'
+        sc0 = wf.sc0; sc1 = wf.sc1;
+        w = (Sc - sc0) ./ max(sc1 - sc0, eps);
+        w = min(1, max(0, w));
+    case 'logistic'
+        sc0 = wf.sc0;
+        k = wf.k;
+        w = 1 ./ (1 + exp(-k*(Sc - sc0)));
+    otherwise
+        error('Unknown wfun.type: %s', wf.type);
+end
+
+w(bad) = NaN;
+w = min(1, max(0, w));
+end
+
+function [rec, spec] = local_confusion(y, yhat)
+TP = nnz( y &  yhat); FN = nnz( y & ~yhat);
+TN = nnz(~y & ~yhat); FP = nnz(~y &  yhat);
+rec  = TP / max(1, (TP+FN));
+spec = TN / max(1, (TN+FP));
+rec  = max(0,min(1,rec));
+spec = max(0,min(1,spec));
+end
+
+function [rec, spec] = local_confusion_weighted(w, yhat)
+w = double(w(:));
+yhat = logical(yhat(:));
+
+TP = sum(w .*  yhat, 'omitnan');
+FN = sum(w .* ~yhat, 'omitnan');
+TN = sum((1-w) .* ~yhat, 'omitnan');
+FP = sum((1-w) .*  yhat, 'omitnan');
+
+rec  = TP / max(eps, (TP+FN));
+spec = TN / max(eps, (TN+FP));
+rec  = max(0,min(1,rec));
+spec = max(0,min(1,spec));
+end
+
+% =====================================================================
+%                             MISC HELPERS
+% =====================================================================
+
+function cfg = set_default(cfg, f, v)
+if ~isfield(cfg,f) || isempty(cfg.(f)), cfg.(f) = v; end
+end
+
+function key = cache_key(p, roundv, cfg)
+p = p(:).';
+if strcmpi(cfg.template_mode,'gradient')
+    Aeff = p(2);
+    if isfield(cfg,'A_nonneg') && cfg.A_nonneg, Aeff = max(Aeff,0); end
+    if cfg.sample_angle
+        p = [p(1), Aeff, p(3)];
+    else
+        p = [p(1), Aeff];
+    end
+end
+
+if strcmpi(cfg.template_mode,'gradient') && cfg.sample_angle
+    p = [round(p(1)/roundv(1))*roundv(1), ...
+         round(p(2)/roundv(2))*roundv(2), ...
+         round(p(3)/roundv(3))*roundv(3)];
+elseif numel(p) >= 2
+    p = [round(p(1)/roundv(1))*roundv(1), ...
+         round(p(2)/roundv(2))*roundv(2)];
+end
+
+if numel(p)==3
+    key = sprintf('%.2f|%.2f|%.1f', p);
+else
+    key = sprintf('%.2f|%.2f', p);
+end
+end
+
+function th = wrap_theta(th, range_deg)
+lo = range_deg(1); hi = range_deg(2); span = hi - lo;
+th = lo + mod(th - lo, 2*span);
+if th > hi, th = hi - (th - hi); end
+end
+
+function y = wrap_centered(x, c)
+y = x;
+while y > c+180, y = y-360; end
+while y < c-180, y = y+360; end
+end
+
+function z = clamp01(z)
+z = max(0, min(1, z));
+end
+
+function p = softbox_penalty(x, rng, k)
+a = rng(1); b = rng(2);
+if x < a
+    p = ((a-x)/k).^2;
+elseif x > b
+    p = ((x-b)/k).^2;
+else
+    p = 0;
+end
+end
+
+function [f_floor, f_cap] = physics_clip_stats(G, flo, cap, roi_idx)
+if nargin < 4 || isempty(roi_idx)
+    mask = isfinite(G);
+else
+    mask = false(size(G)); mask(roi_idx) = true; mask = mask & isfinite(G);
+end
+gg = G(mask); n = numel(gg);
+if n == 0, f_floor = NaN; f_cap = NaN; return; end
+f_floor = nnz(gg <= flo + eps(class(G))) / n;
+if isempty(cap)
+    f_cap = 0;
+else
+    f_cap = nnz(gg >= cap - eps(class(G))) / n;
+end
+end
+
+function print_phys_stats(prefix, pst)
+try
+    fprintf('[phys|%s] min=%.2f max=%.2f mean=%.2f | floor%%=%.2f cap%%=%.2f\n', ...
+        prefix, pst.min_after, pst.max_after, pst.mean_after, 100*pst.f_floor, 100*pst.f_cap);
+catch
+end
+end
+
+function U = unit_gradient_angle(X, Y, theta_deg)
+t  = deg2rad(theta_deg);
+nx = cos(t); ny = sin(t);
+xc = X - mean(X(:),'omitnan');
+yc = Y - mean(Y(:),'omitnan');
+P  = xc*nx + yc*ny;
+pmin = min(P(:)); pmax = max(P(:));
+if ~isfinite(pmin) || ~isfinite(pmax) || pmax==pmin
+    U = zeros(size(P),'like',X);
+else
+    U = single( 2*(P - (pmin+pmax)/2) / (pmax - pmin) ); % ~[-1,1]
+end
+end
+
+function Zs = standardize_Z(Z)
+m = mean(Z(:), 'omitnan');
+s = std(Z(:), 0, 'omitnan');
+if ~isfinite(s) || s < eps('single')
+    Zs = Z - m;
+else
+    Zs = (Z - m) ./ s;
+end
+end
+
+function names = param_names(cfg)
+if strcmpi(cfg.template_mode,'gradient')
+    names = ternary(cfg.sample_angle, {'mu','A','theta_deg'}, {'mu','A'});
+else
+    names = {'mu','sigma'};
+end
+end
+
+function out = ternary(cond, a, b)
+if cond, out = a; else, out = b; end
+end
+
+function s = fmtv(v)
+s = sprintf('[%s]', strjoin(compose('%.3f', v(:).'), ', '));
+end
+
+% =====================================================================
+%                           MAP SAVING / PLOTTING
+% =====================================================================
+
+function ok = save_one_map(G, X, Y, cfg, outdir, tag, clim, keep_open)
+if nargin < 7 || isempty(clim)
+    g = G(isfinite(G));
+    if isempty(g)
+        clim = [0 1];
+    else
+        p = prctile(g,[2 98]);
+        clim = [p(1) p(2)];
+        if ~isfinite(clim(1)) || ~isfinite(clim(2)) || clim(1)==clim(2)
+            clim = [min(g) max(g)];
+            if clim(1)==clim(2), clim = clim + [-1 1]; end
+        end
+    end
+end
+if nargin < 8, keep_open = false; end
+
+ds = 1;
+if isfield(cfg,'map_downsample') && ~isempty(cfg.map_downsample) && cfg.map_downsample > 1
+    ds = round(cfg.map_downsample);
+end
+
+Xmin = min(X(:)); Xmax = max(X(:));
+Ymin = min(Y(:)); Ymax = max(Y(:));
+
+if ds > 1
+    Gd = G(1:ds:end, 1:ds:end);
+    ok = save_map_figure(Gd, [Xmin Xmax], [Ymin Ymax], clim, cfg, outdir, tag, keep_open);
+else
+    ok = save_map_figure(G,  [Xmin Xmax], [Ymin Ymax], clim, cfg, outdir, tag, keep_open);
+end
+end
+
+function ok = save_map_figure(G, XYXlim, XYYlim, clim, cfg, outdir, name, keep_open)
+if nargin < 8, keep_open = false; end
+if ~exist(outdir,'dir'), mkdir(outdir); end
+
+f = figure('Visible', ternary(keep_open,'on','off'), ...
+           'Color','w','Units','pixels','Position',[100 100 1000 800]);
+
+imagesc('XData', XYXlim, 'YData', XYYlim, 'CData', G);
+set(gca,'YDir','normal'); axis image tight
+caxis(clim);
+cb = colorbar; cb.Label.String = 'Geothermal heat flow (mW m^{-2})';
+xlabel('x (m)'); ylabel('y (m)');
+title(sprintf('GHF map - %s', string(name)));
+
+png_path = fullfile(outdir, sprintf('%s.png', string(name)));
+exportgraphics(f, png_path, 'Resolution', 300);
+
+if isfield(cfg,'export_pdf') && cfg.export_pdf
+    pdf_path = fullfile(outdir, sprintf('%s.pdf', string(name)));
+    exportgraphics(f, pdf_path, 'ContentType','vector');
+end
+
+if ~keep_open
+    close(f);
+end
+ok = true;
+end
+
+function plot_trace(y, labelStr, ~, run_id, outdir)
+fig = figure('Color','w','Name',['Trace ' labelStr],'Visible','off');
+plot(y,'-'); grid on; xlabel('iter'); ylabel(labelStr);
+title(['Trace: ' labelStr]);
+outpng = fullfile(outdir, sprintf('mcmc_trace_%s_%s.png', regexprep(lower(labelStr),'[^a-z0-9]+','_'), run_id));
+exportgraphics(fig, outpng, 'Resolution', 280);
+close(fig);
+fprintf('[plot] %s\n', outpng);
+end
+
+function plot_posterior(samples, names, ~, run_id, outdir)
+fig = figure('Color','w','Name','Posterior','Visible','off');
+n = size(samples,2);
+tiledlayout(n,1,'Padding','compact','TileSpacing','compact');
+for i=1:n
+    nexttile; histogram(samples(:,i), 'Normalization','pdf','NumBins', 40);
+    grid on; xlabel(names{i}); ylabel('pdf'); title(['Posterior of ' names{i}]);
+end
+outpng = fullfile(outdir, sprintf('mcmc_posterior_%s.png', run_id));
+exportgraphics(fig, outpng, 'Resolution', 280);
+close(fig);
+fprintf('[plot] %s\n', outpng);
+end
+
+function plot_pairs(samples, names, ~, run_id, outdir)
+fig = figure('Color','w','Name','Pairs','Visible','off');
+n = size(samples,2);
+tiledlayout(n, n, 'Padding','compact','TileSpacing','compact');
+for i=1:n
+    for j=1:n
+        nexttile;
+        if i==j
+            histogram(samples(:,i), 'Normalization','pdf','NumBins', 30);
+            ylabel('pdf'); xlabel(names{i});
+        else
+            scatter(samples(:,j), samples(:,i), 8, 'k', 'filled', ...
+                'MarkerFaceAlpha', 0.1, 'MarkerEdgeAlpha', 0.1);
+            xlabel(names{j}); ylabel(names{i});
+        end
+        grid on;
+    end
+end
+outpng = fullfile(outdir, sprintf('mcmc_pairs_%s.png', run_id));
+exportgraphics(fig, outpng, 'Resolution', 280);
+close(fig);
+fprintf('[plot] %s\n', outpng);
+end
+
+% =====================================================================
+%                           STUB: GEOTIFF EXPORT
+% =====================================================================
+
+% function qgis_save_geotiff(G, X, Y, out_tif, nodata)
+% % You already have this in your codebase; keeping a stub here so the file is runnable.
+% % Replace this stub with your real qgis_save_geotiff.
+% if nargin < 5, nodata = -9999; end %#ok<NASGU>
+% fprintf('[geotiff] (stub) would write: %s\n', out_tif);
+% end
